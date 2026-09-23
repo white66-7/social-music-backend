@@ -1,6 +1,6 @@
 import { redis, REDIS_ROOM_KEY } from '../../lib/redis.js';
 
-// 房间租约时长：15 秒（若房主超过 15 秒未发心跳，视为房间自然解散）
+// 房间租约时长：15 秒
 const ROOM_LEASE_SECONDS = 15;
 
 export default async function handler(req, res) {
@@ -61,12 +61,12 @@ export default async function handler(req, res) {
       return res.status(404).json({ code: 404, message: '房间已失效或不是房主' });
     }
 
-    // 3. 主动关闭房间
-    if (action === 'stop') {
-      if (currentRoom && currentRoom.inviter === username) {
+
+    if (action === 'stop' || action === 'expire') {
+      if (action === 'expire' || (currentRoom && currentRoom.inviter === username)) {
         await redis.del(REDIS_ROOM_KEY);
       }
-      return res.status(200).json({ code: 0, message: '房间已关闭' });
+      return res.status(200).json({ code: 0, message: '房间已释放' });
     }
 
     return res.status(200).json({ code: 0, message: 'ok' });
