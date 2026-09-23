@@ -1,0 +1,13 @@
+{
+  "name": "social-music-backend",
+  "version": "1.0.0",
+  "description": "white66的朋友圈后端",
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev"
+  },
+  "dependencies": {
+    "@upstash/redis": "^1.34.3",
+    "jsonwebtoken": "^9.0.2"
+  }
+}
