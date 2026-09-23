@@ -1,12 +1,10 @@
 import { redis, REDIS_ROOM_KEY } from '../../lib/redis.js';
 
-const ROOM_TTL_SECONDS = 7200; 
+// 房间租约时长：15 秒（若房主超过 15 秒未发心跳，视为房间自然解散）
+const ROOM_LEASE_SECONDS = 15;
 
 export default async function handler(req, res) {
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-
+  if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') {
     return res.status(405).json({ code: 405, message: '仅支持 POST 请求' });
   }
@@ -23,6 +21,7 @@ export default async function handler(req, res) {
       ? (typeof currentRoomRaw === 'string' ? JSON.parse(currentRoomRaw) : currentRoomRaw)
       : null;
 
+    // 1. 开启房间
     if (action === 'start') {
       if (currentRoom && currentRoom.inviter !== username) {
         return res.status(409).json({
@@ -35,33 +34,34 @@ export default async function handler(req, res) {
         return res.status(400).json({ code: 400, message: '缺少房间链接或房间号' });
       }
 
-      // 解析口令里是否有自定义 baseUrl
-      let serverUrl = 'https://neriplayer.hancat.work';
-      try {
-        const queryPart = deepLink.split('?')[1] || '';
-        const params = new URLSearchParams(queryPart);
-        if (params.get('baseUrl')) {
-          serverUrl = decodeURIComponent(params.get('baseUrl'));
-        }
-      } catch (e) {}
-
       const newRoomPayload = {
         roomId,
         inviter: inviter || username,
         secret: secret || '',
         deepLink,
-        serverUrl,
         updatedAt: Math.floor(Date.now() / 1000)
       };
 
       await redis.set(REDIS_ROOM_KEY, JSON.stringify(newRoomPayload), {
-        ex: ROOM_TTL_SECONDS
+        ex: ROOM_LEASE_SECONDS
       });
 
       return res.status(200).json({ code: 0, message: '房间开播成功', data: newRoomPayload });
     }
 
-    // 房主在 App 里主动点结束
+    // 2. 房主心跳续期（每 5 秒发送一次）
+    if (action === 'heartbeat') {
+      if (currentRoom && currentRoom.inviter === username) {
+        currentRoom.updatedAt = Math.floor(Date.now() / 1000);
+        await redis.set(REDIS_ROOM_KEY, JSON.stringify(currentRoom), {
+          ex: ROOM_LEASE_SECONDS
+        });
+        return res.status(200).json({ code: 0, message: '续期成功' });
+      }
+      return res.status(404).json({ code: 404, message: '房间已失效或不是房主' });
+    }
+
+    // 3. 主动关闭房间
     if (action === 'stop') {
       if (currentRoom && currentRoom.inviter === username) {
         await redis.del(REDIS_ROOM_KEY);
