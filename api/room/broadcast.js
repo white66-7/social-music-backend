@@ -90,7 +90,6 @@ export default async function handler(req, res) {
       ? (typeof currentRoomRaw === 'string' ? JSON.parse(currentRoomRaw) : currentRoomRaw)
       : null;
 
-    // 1. 开启放歌 (start)
     if (action === 'start') {
       const roomOwner = currentRoom ? (currentRoom.publisher || currentRoom.inviter) : null;
       if (currentRoom && roomOwner !== username) {
@@ -106,10 +105,7 @@ export default async function handler(req, res) {
 
       const probeResult = await probeNeriRoomOnCloud(serverUrl, roomId, secret);
       if (!probeResult.alive) {
-        return res.status(400).json({
-          code: 400,
-          message: probeResult.message
-        });
+        return res.status(400).json({ code: 400, message: probeResult.message });
       }
 
       let hostAvatarUrl = '';
@@ -118,19 +114,11 @@ export default async function handler(req, res) {
 
       try {
         const db = await getDatabase();
-        const users = db.collection('users');
         const roomLogs = db.collection('room_logs');
-
-        const userDoc = await users.findOne({ username });
-        if (userDoc?.avatarUrl) {
-          hostAvatarUrl = userDoc.avatarUrl;
-        }
-
         const insertResult = await roomLogs.insertOne({
           roomId,
           publisher: username,
           inviter: inviter || username,
-          hostAvatarUrl,
           deepLink,
           status: 'active',
           startedAt: now,
@@ -141,6 +129,16 @@ export default async function handler(req, res) {
       } catch (err) {
         console.warn('[MongoDB 警告] 记录日志失败:', err.message);
       }
+
+      // 从 Redis 成员列表中抓取该用户的头像
+      try {
+        const rawMembers = await redis.hvals('app:circle_members');
+        const list = (rawMembers || []).map(m => typeof m === 'string' ? JSON.parse(m) : m);
+        const match = list.find(u => u.username === username || u.qq === username);
+        if (match?.avatarUrl) {
+          hostAvatarUrl = match.avatarUrl;
+        }
+      } catch (_) {}
 
       const newRoomPayload = {
         roomId,
@@ -166,7 +164,6 @@ export default async function handler(req, res) {
       });
     }
 
-    // 2. 房主心跳 (heartbeat)
     if (action === 'heartbeat') {
       const roomOwner = currentRoom ? (currentRoom.publisher || currentRoom.inviter) : null;
       if (currentRoom && roomOwner === username) {
@@ -179,7 +176,6 @@ export default async function handler(req, res) {
       return res.status(404).json({ code: 404, message: '房间已失效或不是房主' });
     }
 
-    // 3. 关闭房间 (stop / expire)
     if (action === 'stop' || action === 'expire') {
       const roomOwner = currentRoom ? (currentRoom.publisher || currentRoom.inviter) : null;
       if (currentRoom && roomOwner === username) {
@@ -208,7 +204,7 @@ export default async function handler(req, res) {
 
     return res.status(200).json({ code: 0, message: 'ok' });
   } catch (error) {
-    console.error('[Broadcast Error]', error);
+    console.error('[Broadcast API Error]', error);
     return res.status(500).json({ code: 500, message: '服务器内部错误' });
   }
 }

@@ -1,5 +1,3 @@
-// pages/api/user/list.js
-import { getDatabase } from '../../lib/mongodb.js';
 import { redis, REDIS_ROOM_KEY } from '../../lib/redis.js';
 
 export default async function handler(req, res) {
@@ -9,22 +7,14 @@ export default async function handler(req, res) {
   }
 
   try {
-    const db = await getDatabase();
-    const usersCollection = db.collection('users');
+    // 1. 从 Redis 直接拉取所有成员
+    const rawMembers = await redis.hvals('app:circle_members');
+    const members = (rawMembers || []).map(item => (typeof item === 'string' ? JSON.parse(item) : item));
 
-    // 1. 查询所有通过密钥注册/登录的用户，按最近活跃时间倒序排列
-    const users = await usersCollection
-      .find({})
-      .sort({ lastActiveAt: -1, createdAt: -1 })
-      .project({
-        username: 1,
-        avatarUrl: 1,
-        lastActiveAt: 1,
-        createdAt: 1
-      })
-      .toArray();
+    // 按活跃时间倒序
+    members.sort((a, b) => (b.lastActiveAt || 0) - (a.lastActiveAt || 0));
 
-    // 2. 顺带检查当前谁在放歌
+    // 2. 检查当前活跃房主
     let currentHost = null;
     try {
       const currentRoomRaw = await redis.get(REDIS_ROOM_KEY);
@@ -34,21 +24,21 @@ export default async function handler(req, res) {
       }
     } catch (_) {}
 
-    // 3. 组装成员数据，标记谁是当前房主
-    const memberList = users.map(user => ({
-      username: user.username,
-      avatarUrl: user.avatarUrl || '',
-      isHosting: currentHost ? (user.username === currentHost) : false,
-      lastActiveAt: user.lastActiveAt || user.createdAt || null
+    // 3. 组装响应数据（脱敏掉 pin）
+    const dataList = members.map(m => ({
+      qq: m.qq,
+      username: m.username,
+      avatarUrl: m.avatarUrl || `https://q1.qlogo.cn/g?b=qq&nk=${m.qq}&s=640`,
+      isHosting: currentHost ? (m.username === currentHost || m.qq === currentHost) : false
     }));
 
     return res.status(200).json({
       code: 0,
-      total: memberList.length,
-      data: memberList
+      total: dataList.length,
+      data: dataList
     });
   } catch (error) {
-    console.error('[Get Users List Error]', error);
+    console.error('[User List API Error]', error);
     return res.status(500).json({ code: 500, message: '获取成员列表失败' });
   }
 }
