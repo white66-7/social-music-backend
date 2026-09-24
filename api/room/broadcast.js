@@ -1,76 +1,7 @@
-import crypto from 'crypto';
-import { redis, REDIS_ROOM_KEY } from '../../lib/redis.js';
+import { redis, REDIS_ROOM_KEY, loadRoom, renewRoom } from '../../lib/redis.js';
+import { verifyRoomSecret } from '../../lib/neri.js';
 import { getDatabase } from '../../lib/mongodb.js';
 import { ObjectId } from 'mongodb';
-
-const ROOM_LEASE_SECONDS = 12;
-
-async function probeNeriRoomOnCloud(serverUrl, roomId, secret) {
-  try {
-    let base = (serverUrl || 'https://neriplayer.hancat.work').trim();
-    if (!/^https?:\/\//i.test(base)) base = 'https://' + base;
-    base = base.replace(/\/+$/, '');
-
-    const userUuid = crypto.randomUUID();
-    const joinUrl = `${base}/api/rooms/${encodeURIComponent(roomId)}/join`;
-
-    const joinResponse = await fetch(joinUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Linux; Android 10) NeriPlayer/1.0',
-        'Accept': 'application/json'
-      },
-      body: JSON.stringify({
-        userUuid: userUuid,
-        nickname: '审核助手',
-        joinSecret: (secret || '').trim()
-      }),
-      signal: AbortSignal.timeout(3500)
-    });
-
-    const joinText = await joinResponse.text();
-    let result = null;
-    try {
-      result = JSON.parse(joinText);
-    } catch (_) {}
-
-    if (!joinResponse.ok || !result || result.ok !== true) {
-      let errMsg = '该 NeriPlayer 房间不存在或口令已失效';
-      if (result?.error) {
-        const errLower = result.error.toLowerCase();
-        if (errLower.includes('secret') || errLower.includes('unauthorized')) {
-          errMsg = '房间口令/密钥错误或已失效';
-        } else if (errLower.includes('not found') || errLower.includes('room missing')) {
-          errMsg = '房间已关闭或房主已离开';
-        } else {
-          errMsg = `房间拒绝: ${result.error}`;
-        }
-      }
-      return { alive: false, message: errMsg };
-    }
-
-    const token = result.token;
-    if (token) {
-      fetch(`${base}/api/rooms/${encodeURIComponent(roomId)}/leave`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
-          'User-Agent': 'Mozilla/5.0 (Linux; Android 10) NeriPlayer/1.0'
-        },
-        body: JSON.stringify({})
-      }).catch(() => {});
-    }
-
-    return { alive: true };
-  } catch (error) {
-    return {
-      alive: false,
-      message: `核验超时或无法连通节点: ${error.message || '请检查服务器配置'}`
-    };
-  }
-}
 
 export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
@@ -85,10 +16,7 @@ export default async function handler(req, res) {
       return res.status(400).json({ code: 400, message: '缺少 action 参数' });
     }
 
-    const currentRoomRaw = await redis.get(REDIS_ROOM_KEY);
-    const currentRoom = currentRoomRaw
-      ? (typeof currentRoomRaw === 'string' ? JSON.parse(currentRoomRaw) : currentRoomRaw)
-      : null;
+    const currentRoom = await loadRoom();
 
     if (action === 'start') {
       const roomOwner = currentRoom ? (currentRoom.publisher || currentRoom.inviter) : null;
@@ -103,8 +31,12 @@ export default async function handler(req, res) {
         return res.status(400).json({ code: 400, message: '缺少房间链接或房间号' });
       }
 
-      const probeResult = await probeNeriRoomOnCloud(serverUrl, roomId, secret);
-      if (!probeResult.alive) {
+      // 开播前唯一一次真核验：需要真的用 joinSecret 加入才能确认密钥正确。
+      // 这会触发 NeriPlayer 的 autoPauseOnMemberChange（加入 + 退出各暂停一次），
+      // 但此刻房间刚建、还没有听众，只影响房主自己，可以接受。
+      // ⚠️ 绝不要把这条路径挪到轮询里，轮询必须用 lib/neri.js 的 checkRoomExists。
+      const probeResult = await verifyRoomSecret(serverUrl, roomId, secret);
+      if (!probeResult.ok) {
         return res.status(400).json({ code: 400, message: probeResult.message });
       }
 
@@ -151,12 +83,11 @@ export default async function handler(req, res) {
         serverUrl: serverUrl || '',
         mongoLogId,
         lastProbedAt: now.getTime(),
+        lastHeartbeatAt: now.getTime(),
         updatedAt: Math.floor(now.getTime() / 1000)
       };
 
-      await redis.set(REDIS_ROOM_KEY, JSON.stringify(newRoomPayload), {
-        ex: ROOM_LEASE_SECONDS
-      });
+      await renewRoom(newRoomPayload);
 
       return res.status(200).json({
         code: 0,
@@ -168,10 +99,11 @@ export default async function handler(req, res) {
     if (action === 'heartbeat') {
       const roomOwner = currentRoom ? (currentRoom.publisher || currentRoom.inviter) : null;
       if (currentRoom && roomOwner === username) {
-        currentRoom.updatedAt = Math.floor(Date.now() / 1000);
-        await redis.set(REDIS_ROOM_KEY, JSON.stringify(currentRoom), {
-          ex: ROOM_LEASE_SECONDS
-        });
+        const now = Date.now();
+        currentRoom.updatedAt = Math.floor(now / 1000);
+        currentRoom.lastHeartbeatAt = now;
+        // 心跳负责续租，这是房间存活的唯一依据
+        await renewRoom(currentRoom);
         return res.status(200).json({ code: 0, message: '续期成功' });
       }
       return res.status(404).json({ code: 404, message: '房间已失效或不是房主' });
