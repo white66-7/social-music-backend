@@ -5,22 +5,14 @@ import { ObjectId } from 'mongodb';
 
 const ROOM_LEASE_SECONDS = 30;
 
-/**
- * 云端精准探活：使用标准 WebSocket 客户端检测 NeriPlayer 房间真实可用性
- * 
- * 核心优化：
- * 1. 彻底根除假阳性：网络不通、域名错误、HTTP 4xx/5xx、超时均严格判定为【不可用】；
- * 2. 深度鉴权拦截：完整监听 WebSocket 握手及建连后的 Close 状态码（1008/4xxx）；
- * 3. 避免扰乱真实房间：核验通过后使用标准 Code 1000 优雅退出，严禁粗暴 RST 断流；
- * 4. 严防 Serverless 挂起：统一 Promise 结算与定时器/Socket 资源清理。
- */
-function probeNeriRoomOnCloud(serverUrl, roomId, secret, timeoutMs = 3500) {
+
+function probeNeriRoomOnCloud(serverUrl, roomId, secret, timeoutMs = 4000) {
   return new Promise((resolve) => {
     let isSettled = false;
     let timer = null;
     let ws = null;
 
-    // 统一结算与资源清理，防止 Serverless 函数内存泄漏或卡死
+    // 核心安全清理函数：彻底杜绝 Uncaught Exception
     const finish = (result) => {
       if (isSettled) return;
       isSettled = true;
@@ -32,9 +24,12 @@ function probeNeriRoomOnCloud(serverUrl, roomId, secret, timeoutMs = 3500) {
 
       if (ws) {
         try {
+          // 1. 先清空之前的监听器
           ws.removeAllListeners();
+          // 2. 🌟 关键修复：挂载空函数接盘，防止 terminate 触发未捕获的 'error' 导致进程崩溃
+          ws.on('error', () => {});
+
           if (ws.readyState === WebSocket.OPEN) {
-            // 使用标准 1000 正常关闭，绝不触发服务端的异常广播
             ws.close(1000, 'Probe Completed');
           } else {
             ws.terminate();
@@ -46,7 +41,7 @@ function probeNeriRoomOnCloud(serverUrl, roomId, secret, timeoutMs = 3500) {
     };
 
     try {
-      // 1. 规范化 URL 地址与协议转换 (http -> ws, https -> wss)
+      // 1. 规范化地址
       let base = (serverUrl || 'https://neriplayer.hancat.work').trim();
       if (!/^https?:\/\//i.test(base) && !/^wss?:\/\//i.test(base)) {
         base = 'https://' + base;
@@ -61,19 +56,18 @@ function probeNeriRoomOnCloud(serverUrl, roomId, secret, timeoutMs = 3500) {
       if (secret) {
         wsUrl.searchParams.set('secret', secret);
       }
-      // 符合 NeriPlayer 1-24 位字符规范
       wsUrl.searchParams.set('nickname', 'SystemProbe');
 
-      // 2. 超时兜底（防止目标服务器不响应卡住接口）
+      // 2. 超时保护
       timer = setTimeout(() => {
         finish({
           alive: false,
           code: 408,
-          message: '连接房间超时，服务器未响应或节点已离线'
+          message: '连接房间超时，服务器响应过慢'
         });
       }, timeoutMs);
 
-      // 3. 建立标准 WebSocket 连接
+      // 3. 发起 WebSocket 请求（模拟 Android 客户端请求头）
       ws = new WebSocket(wsUrl.toString(), {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Linux; Android 10) NeriPlayer/1.0',
@@ -82,56 +76,57 @@ function probeNeriRoomOnCloud(serverUrl, roomId, secret, timeoutMs = 3500) {
         handshakeTimeout: 3000
       });
 
-      // 4. 监听 HTTP 协议升级失败（目标服务返回 400/401/403/404/500/502 等）
+      // 4. 监听 HTTP 响应异常（重点：读取 200/403/404 的实际响应内容）
       ws.on('unexpected-response', (req, res) => {
-        const status = res.statusCode || 500;
-        let msg = `服务端拒绝连接 (HTTP ${status})`;
-        if (status === 404) {
-          msg = '该房间不存在或已关闭 (404)';
-        } else if (status === 401 || status === 403) {
-          msg = '房间口令/密钥错误或拒绝加入 (403)';
-        } else if (status === 400) {
-          msg = '口令格式不合规或参数错误 (400)';
-        } else if (status >= 500) {
-          msg = `Neri 节点服务器异常 (HTTP ${status})`;
-        }
-        finish({ alive: false, code: status, message: msg });
+        let respBody = '';
+        res.on('data', (chunk) => {
+          respBody += chunk;
+        });
+        res.on('end', () => {
+          const status = res.statusCode || 500;
+          console.error(`[Probe 异常响应] 状态码: ${status}, 内容摘要: ${respBody.slice(0, 150)}`);
+
+          let msg = `服务端未建立连接 (HTTP ${status})`;
+          if (status === 200) {
+            msg = '房间节点未开启 WebSocket 或返回了普通网页';
+          } else if (status === 404) {
+            msg = '该房间不存在或已解散 (404)';
+          } else if (status === 403 || status === 401) {
+            msg = '房间密钥无效或拒绝加入 (403)';
+          }
+
+          finish({ alive: false, code: status, message: msg });
+        });
       });
 
-      // 5. 监听底层网络异常（DNS 解析失败、连接被重置、拒绝连接等）
+      // 5. 监听网络层错误
       ws.on('error', (err) => {
         finish({
           alive: false,
           code: -1,
-          message: `无法连接到房间节点: ${err.message || '网络不可达'}`
+          message: `连接失败: ${err.message || '网络不可达'}`
         });
       });
 
-      // 6. 监听业务鉴权踢出（如握手成功后，服务端立即下发 1008 或 4xxx 关闭帧）
+      // 6. 监听关闭事件
       ws.on('close', (code, reason) => {
         const reasonText = reason ? reason.toString() : '';
-        if (code === 1008) {
+        if (code === 1008 || code >= 4000) {
           finish({
             alive: false,
             code,
-            message: `房间安全策略拒绝: ${reasonText || '密钥无效'}`
-          });
-        } else if (code >= 4000) {
-          finish({
-            alive: false,
-            code,
-            message: `房间拒绝加入 (${code}): ${reasonText || '房间已关闭或密钥过期'}`
+            message: `房间拒绝: ${reasonText || '口令无效'}`
           });
         } else if (code !== 1000) {
           finish({
             alive: false,
             code,
-            message: `连接被异常中断 (code ${code}): ${reasonText || '未知原因'}`
+            message: `连接中断 (code ${code}): ${reasonText}`
           });
         }
       });
 
-      // 7. 成功握手，并留出 300ms 缓冲防“秒踢”
+      // 7. 握手成功并保持片刻
       ws.on('open', () => {
         setTimeout(() => {
           finish({ alive: true, code: 0, message: '房间正常存活' });
@@ -142,7 +137,7 @@ function probeNeriRoomOnCloud(serverUrl, roomId, secret, timeoutMs = 3500) {
       finish({
         alive: false,
         code: -2,
-        message: `探活初始化异常: ${e.message}`
+        message: `探活参数异常: ${e.message}`
       });
     }
   });
