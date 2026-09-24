@@ -1,5 +1,11 @@
 // pages/api/auth/login.js
+import { getDatabase } from '../../lib/mongodb.js';
 import { redis } from '../../lib/redis.js';
+import jwt from 'jsonwebtoken';
+import bcrypt from 'bcryptjs';
+
+// 用于 JWT 签名的密钥，优先读取环境变量
+const JWT_SECRET = process.env.JWT_SECRET || 'white667-social-music-secure-jwt-key';
 
 export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
@@ -21,60 +27,104 @@ export default async function handler(req, res) {
       return res.status(400).json({ code: 400, message: '请输入 4 位专属口令' });
     }
 
-    // 1. 查询 Redis
-    const userRaw = await redis.hget('app:circle_members', cleanQq);
+    //利用 Redis 进行防爆破拦截（4位 PIN 码仅 10000 种组合，必须限制）
+    const failRateKey = `login:fail:${cleanQq}`;
+    const failCount = await redis.get(failRateKey);
+    if (failCount && parseInt(failCount, 10) >= 5) {
+      return res.status(429).json({ 
+        code: 429, 
+        message: '口令错误次数过多，请 10 分钟后再试' 
+      });
+    }
 
-    if (userRaw) {
-      const existingUser = typeof userRaw === 'string' ? JSON.parse(userRaw) : userRaw;
+    // 连接 MongoDB 查验用户
+    const db = await getDatabase();
+    const usersCollection = db.collection('users');
 
-      // 🌟 严格校验：只要有记录且已设置过 pin，哪怕差一位也绝对报错！
-      if (existingUser.pin) {
-        if (String(existingUser.pin).trim() !== cleanPin) {
-          return res.status(403).json({ 
-            code: 403, 
-            message: '该 QQ 已绑定口令，口令错误！' 
-          });
-        }
-      } else {
-        // 如果是早期老数据缺失 pin，仅首次补齐绑定
-        existingUser.pin = cleanPin;
+    const existingUser = await usersCollection.findOne({ qq: cleanQq });
+
+    if (existingUser) {
+      // 兼容老明文数据与新 Bcrypt 哈希数据
+      const isMatch = existingUser.pin.startsWith('$2')
+        ? await bcrypt.compare(cleanPin, existingUser.pin)
+        : existingUser.pin === cleanPin;
+
+      if (!isMatch) {
+        // 口令错误，Redis 累计失败次数并设置 10 分钟过期
+        await redis.incr(failRateKey);
+        await redis.expire(failRateKey, 600);
+        return res.status(403).json({ 
+          code: 403, 
+          message: '该 QQ 已绑定口令，口令错误！' 
+        });
       }
 
-      // 刷新活跃时间
-      existingUser.lastActiveAt = Date.now();
-      
-      // 写回 Redis，确保 pin 永远被妥善保存
-      await redis.hset('app:circle_members', cleanQq, JSON.stringify(existingUser));
+      // 登录成功，清除试错记录
+      await redis.del(failRateKey);
+
+      // 如果原来存的是明文口令，顺手升级为加盐密文，并刷新活跃时间
+      const updateData = { lastActiveAt: Date.now() };
+      if (!existingUser.pin.startsWith('$2')) {
+        updateData.pin = await bcrypt.hash(cleanPin, 10);
+      }
+
+      await usersCollection.updateOne(
+        { qq: cleanQq },
+        { $set: updateData }
+      );
+
+      // 签发真正的 JWT Token（30天有效）
+      const token = jwt.sign(
+        { qq: existingUser.qq, username: existingUser.username },
+        JWT_SECRET,
+        { expiresIn: '30d' }
+      );
+
+      // 去除敏感字段后返回前端
+      const { pin: _, _id, ...safeUser } = existingUser;
 
       return res.status(200).json({
         code: 0,
         message: '登录成功',
-        token: `token_${cleanQq}_${Date.now()}`,
-        user: existingUser
+        token, 
+        user: safeUser
       });
     }
 
-    // 2. 新成员首次认证：秒级创建并牢固绑定 pin
+    //新用户注册落库 MongoDB
     const shortQq = cleanQq.slice(-4);
-    const defaultNickname = `音乐人_${shortQq}`;
+    const defaultNickname = `网友_${shortQq}`;
     const avatarUrl = `https://q1.qlogo.cn/g?b=qq&nk=${cleanQq}&s=640`;
+
+    // PIN 加盐哈希加密，杜绝明文入库
+    const hashedPin = await bcrypt.hash(cleanPin, 10);
 
     const newUser = {
       qq: cleanQq,
       username: defaultNickname,
       avatarUrl: avatarUrl,
-      pin: cleanPin, // 👈 首次直接落盘
+      pin: hashedPin,
       createdAt: Date.now(),
       lastActiveAt: Date.now()
     };
 
-    await redis.hset('app:circle_members', cleanQq, JSON.stringify(newUser));
+    await usersCollection.insertOne(newUser);
+    await redis.del(failRateKey);
+
+    // 签发 JWT
+    const token = jwt.sign(
+      { qq: newUser.qq, username: newUser.username },
+      JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+
+    const { pin: _, _id, ...safeUser } = newUser;
 
     return res.status(200).json({
       code: 0,
       message: '首次认证并绑定成功',
-      token: `token_${cleanQq}_${Date.now()}`,
-      user: newUser
+      token,
+      user: safeUser
     });
 
   } catch (error) {

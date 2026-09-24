@@ -8,7 +8,8 @@
   },
   "dependencies": {
     "@upstash/redis": "^1.34.3",
-    "jsonwebtoken": "^9.0.2",
+    "bcryptjs": "^3.0.3",
+    "jsonwebtoken": "^9.0.3",
     "mongodb": "^7.6.0",
     "ws": "^8.21.3"
   }
