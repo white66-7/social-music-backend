@@ -31,15 +31,25 @@ export default async function handler(req, res) {
       return res.status(400).json({ code: 400, message: '昵称最多 12 个字' });
     }
 
+    // 尝试获取用户
     const userRaw = await redis.hget('app:circle_members', targetQq);
+    let user;
+
     if (!userRaw) {
-      return res.status(404).json({ code: 404, message: '用户不存在' });
+      // 🌟 核心改进：如果 Redis 还没有此人，不要返回 404，而是直接自动登记入库！
+      user = {
+        qq: targetQq,
+        username: cleanName,
+        avatarUrl: `https://q1.qlogo.cn/g?b=qq&nk=${targetQq}&s=640`,
+        lastActiveAt: Date.now()
+      };
+    } else {
+      user = typeof userRaw === 'string' ? JSON.parse(userRaw) : userRaw;
+      user.username = cleanName;
+      user.lastActiveAt = Date.now();
     }
 
-    const user = typeof userRaw === 'string' ? JSON.parse(userRaw) : userRaw;
-    user.username = cleanName;
-    user.lastActiveAt = Date.now();
-
+    // 存入 Redis Hash（以 QQ 为 key）
     await redis.hset('app:circle_members', targetQq, JSON.stringify(user));
 
     return res.status(200).json({
