@@ -1,192 +1,114 @@
 import https from 'https';
-import WebSocket from 'ws';
 
-// 辅助函数：发送原始 HTTP 请求并提取状态码、头信息与返回内容
-function rawHttpRequest(urlStr, headers = {}) {
+// 测试单个端点的 WebSocket 升级响应
+function probeSinglePath(serverUrl, path, queryParams) {
   return new Promise((resolve) => {
     try {
-      const url = new URL(urlStr);
+      const url = new URL(serverUrl);
       const req = https.request({
         hostname: url.hostname,
         port: url.port || 443,
-        path: url.pathname + url.search,
+        path: path + queryParams,
         method: 'GET',
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Linux; Android 10) NeriPlayer/1.0',
-          ...headers
+          'Connection': 'Upgrade',
+          'Upgrade': 'websocket',
+          'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+          'Sec-WebSocket-Version': '13',
+          'User-Agent': 'Mozilla/5.0 (Linux; Android 10) NeriPlayer/1.0'
         },
         timeout: 3000
       });
 
       let isDone = false;
-      const done = (data) => {
+      const finish = (result) => {
         if (!isDone) {
           isDone = true;
           req.destroy();
-          resolve(data);
+          resolve(result);
         }
       };
 
-      // 收到 101 Switching Protocols 升级成功
+      // 命中真实 WebSocket 端点，升级成功
       req.on('upgrade', (res, socket) => {
         socket.destroy();
-        done({
-          type: 'UPGRADE_101',
-          statusCode: 101,
-          headers: res.headers,
-          message: '成功升级为 WebSocket (101 Switching Protocols)'
+        finish({
+          path,
+          status: 101,
+          hit: true,
+          message: '【100% 命中！】这是真实 WebSocket 端点，且握手成功 (101 Switching Protocols)'
         });
       });
 
-      // 收到普通 HTTP 响应
+      // 收到普通的 HTTP 响应
       req.on('response', (res) => {
         let body = '';
         res.on('data', chunk => { body += chunk; });
         res.on('end', () => {
-          done({
-            type: 'HTTP_RESPONSE',
-            statusCode: res.statusCode,
-            headers: res.headers,
-            body: body.slice(0, 300)
+          finish({
+            path,
+            status: res.statusCode,
+            hit: res.statusCode !== 404 && res.statusCode !== 200,
+            body: body.trim()
           });
         });
       });
 
-      req.on('error', (err) => {
-        done({ type: 'NETWORK_ERROR', error: err.message });
-      });
-
-      req.on('timeout', () => {
-        done({ type: 'TIMEOUT', error: '请求超过 3 秒未响应' });
-      });
-
+      req.on('error', err => finish({ path, status: -1, error: err.message }));
+      req.on('timeout', () => finish({ path, status: 408, error: '超时' }));
       req.end();
     } catch (e) {
-      resolve({ type: 'EXCEPTION', error: e.message });
-    }
-  });
-}
-
-// 辅助函数：使用标准 ws 库测试真实连接表现
-function wsClientTest(wsUrlStr) {
-  return new Promise((resolve) => {
-    let ws = null;
-    let timer = null;
-    let isDone = false;
-
-    const done = (res) => {
-      if (!isDone) {
-        isDone = true;
-        if (timer) clearTimeout(timer);
-        if (ws) {
-          try {
-            ws.removeAllListeners();
-            ws.on('error', () => {});
-            ws.terminate();
-          } catch (_) {}
-        }
-        resolve(res);
-      }
-    };
-
-    try {
-      ws = new WebSocket(wsUrlStr, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Linux; Android 10) NeriPlayer/1.0' },
-        handshakeTimeout: 3000
-      });
-
-      timer = setTimeout(() => {
-        done({ status: 'TIMEOUT', message: 'WebSocket 连接超时' });
-      }, 3500);
-
-      ws.on('open', () => {
-        done({ status: 'OPEN_SUCCESS', message: 'WebSocket 连接成功建立！' });
-      });
-
-      ws.on('unexpected-response', (req, res) => {
-        let body = '';
-        res.on('data', c => { body += c; });
-        res.on('end', () => {
-          done({
-            status: 'UNEXPECTED_RESPONSE',
-            statusCode: res.statusCode,
-            body: body.slice(0, 300)
-          });
-        });
-      });
-
-      ws.on('close', (code, reason) => {
-        done({
-          status: 'CLOSED_BY_SERVER',
-          code,
-          reason: reason ? reason.toString() : ''
-        });
-      });
-
-      ws.on('error', (err) => {
-        done({ status: 'ERROR', error: err.message });
-      });
-    } catch (e) {
-      done({ status: 'EXCEPTION', error: e.message });
+      resolve({ path, status: -2, error: e.message });
     }
   });
 }
 
 export default async function handler(req, res) {
-  const roomId = req.query.roomId || req.body?.roomId || '';
-  const secret = req.query.secret || req.body?.secret || '';
-  let server = req.query.server || req.body?.server || 'https://neriplayer.hancat.work';
+  const roomId = req.query.roomId || 'QUYUDY';
+  const secret = req.query.secret || '';
+  let server = req.query.server || 'https://neriplayer.hancat.work';
 
   if (!server.startsWith('http')) server = 'https://' + server;
   server = server.replace(/\/+$/, '');
 
   const queryParams = `?roomId=${encodeURIComponent(roomId)}&secret=${encodeURIComponent(secret)}&nickname=DiagBot`;
 
-  // 并行执行 4 组探针测试
-  const [test1_get_root, test2_upgrade_root, test3_upgrade_ws, test4_ws_client_ws] = await Promise.all([
-    // 实验 1：普通 HTTP GET 请求根路径 /
-    rawHttpRequest(`${server}/`),
+  // 待检测的候选路径列表
+  const candidatePaths = [
+    '/ws',
+    '/join',
+    '/room',
+    '/listen-together',
+    '/listen-together/join',
+    '/api/ws',
+    '/connect',
+    '/__baseline_404__' // 故意放一个不存在的假路由作为 404 基准线
+  ];
 
-    // 实验 2：向根路径 / 发送原生 WebSocket 升级头
-    rawHttpRequest(`${server}/${queryParams}`, {
-      'Connection': 'Upgrade',
-      'Upgrade': 'websocket',
-      'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
-      'Sec-WebSocket-Version': '13'
-    }),
+  // 并发请求所有候选路径
+  const scanResults = await Promise.all(
+    candidatePaths.map(p => probeSinglePath(server, p, queryParams))
+  );
 
-    // 实验 3：向 /ws 路径发送原生 WebSocket 升级头
-    rawHttpRequest(`${server}/ws${queryParams}`, {
-      'Connection': 'Upgrade',
-      'Upgrade': 'websocket',
-      'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
-      'Sec-WebSocket-Version': '13'
-    }),
+  const baseline404 = scanResults.find(r => r.path === '/__baseline_404__');
+  const matchedEndpoint = scanResults.find(r => r.status === 101);
+  const differentBehavior = scanResults.filter(r => 
+    r.path !== '/__baseline_404__' && 
+    (r.status === 101 || r.body !== baseline404?.body)
+  );
 
-    // 实验 4：使用标准 WebSocket 客户端直连 /ws
-    wsClientTest(`${server.replace(/^http/, 'ws')}/ws${queryParams}`)
-  ]);
-
-  // 自动根据测试结果得出确切诊断结论
-  let conclusion = '未知状态';
-  if (test3_upgrade_ws.type === 'UPGRADE_101' || test4_ws_client_ws.status === 'OPEN_SUCCESS') {
-    conclusion = '【确定原因】服务端真实端点正是 /ws，且当前房间和密钥完全有效！';
-  } else if (test3_upgrade_ws.statusCode === 403 || test4_ws_client_ws.code === 1008) {
-    conclusion = '【确定原因】端点为 /ws，但服务器鉴权失败：房间密钥 (secret) 错误或房间未开启！';
-  } else if (test3_upgrade_ws.statusCode === 404) {
-    conclusion = '【确定原因】端点为 /ws，但房间号 (roomId) 不存在或已过期解散！';
-  } else if (test2_upgrade_root.statusCode === 200 && test3_upgrade_ws.statusCode === 200) {
-    conclusion = '【确定原因】Cloudflare CDN 拦截了机房 IP 的 Upgrade 请求，自动降级为 HTTP 200。';
+  let verdict = '未找到任何有效端点';
+  if (matchedEndpoint) {
+    verdict = `【确定结果】真实端点就是：${matchedEndpoint.path}，握手 101 完全成功！`;
+  } else if (differentBehavior.length > 0) {
+    verdict = `【关键发现】以下路径表现与 404 基准线不同，需重点查看：${differentBehavior.map(d => `${d.path}(HTTP ${d.status})`).join(', ')}`;
+  } else {
+    verdict = `【确定结果】所有路由均返回了相同的 404 基准响应。说明房间号 ${roomId} 确实已在服务端过期或不存在！`;
   }
 
   return res.status(200).json({
-    diagnoseTarget: { server, roomId, secretProvided: !!secret },
-    conclusion,
-    details: {
-      experiment1_plain_http_root: test1_get_root,
-      experiment2_upgrade_to_root: test2_upgrade_root,
-      experiment3_upgrade_to_ws: test3_upgrade_ws,
-      experiment4_ws_client_ws: test4_ws_client_ws
-    }
+    target: { server, roomId, hasSecret: !!secret },
+    verdict,
+    scanMatrix: scanResults
   });
 }
