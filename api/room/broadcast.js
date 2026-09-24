@@ -3,31 +3,17 @@ import { redis, REDIS_ROOM_KEY } from '../../lib/redis.js';
 import { getDatabase } from '../../lib/mongodb.js';
 import { ObjectId } from 'mongodb';
 
-const ROOM_LEASE_SECONDS = 30;
+const ROOM_LEASE_SECONDS = 12;
 
-/**
- * 官方标准级探活：完全对齐 NeriPlayer 客户端原生协议
- * 
- * 1. 自动生成标准 UUID v4
- * 2. POST /api/rooms/:roomId/join 申请入房验票
- * 3. 拿到 Token 后，立刻异步 POST /api/rooms/:roomId/leave 释放席位
- * 
- * 优势：
- * - 毫秒级响应（通常 150ms 内完成）
- * - 零误判、零假阳性（与官方 App 行为 100% 相同）
- * - 席位秒释放，不打扰房主听歌，不触发歌曲暂停或切歌
- */
 async function probeNeriRoomOnCloud(serverUrl, roomId, secret) {
   try {
     let base = (serverUrl || 'https://neriplayer.hancat.work').trim();
     if (!/^https?:\/\//i.test(base)) base = 'https://' + base;
     base = base.replace(/\/+$/, '');
 
-    // 必须生成标准的 UUID v4（刚才我们在命令行中验证通过的格式）
     const userUuid = crypto.randomUUID();
     const joinUrl = `${base}/api/rooms/${encodeURIComponent(roomId)}/join`;
 
-    // 1. 发起官方入房申请
     const joinResponse = await fetch(joinUrl, {
       method: 'POST',
       headers: {
@@ -40,7 +26,7 @@ async function probeNeriRoomOnCloud(serverUrl, roomId, secret) {
         nickname: '审核助手',
         joinSecret: (secret || '').trim()
       }),
-      signal: AbortSignal.timeout(4000)
+      signal: AbortSignal.timeout(3500)
     });
 
     const joinText = await joinResponse.text();
@@ -49,7 +35,6 @@ async function probeNeriRoomOnCloud(serverUrl, roomId, secret) {
       result = JSON.parse(joinText);
     } catch (_) {}
 
-    // 2. 核验是否成功入房
     if (!joinResponse.ok || !result || result.ok !== true) {
       let errMsg = '该 NeriPlayer 房间不存在或口令已失效';
       if (result?.error) {
@@ -65,7 +50,6 @@ async function probeNeriRoomOnCloud(serverUrl, roomId, secret) {
       return { alive: false, message: errMsg };
     }
 
-    // 3. 入房验证成功！立即调用 leave 退出，释放席位，绝不打扰房主
     const token = result.token;
     if (token) {
       fetch(`${base}/api/rooms/${encodeURIComponent(roomId)}/leave`, {
@@ -76,14 +60,10 @@ async function probeNeriRoomOnCloud(serverUrl, roomId, secret) {
           'User-Agent': 'Mozilla/5.0 (Linux; Android 10) NeriPlayer/1.0'
         },
         body: JSON.stringify({})
-      }).catch(() => {}); // 异步静默释放，不阻塞主接口响应
+      }).catch(() => {});
     }
 
-    return {
-      alive: true,
-      roomState: result.state || null
-    };
-
+    return { alive: true };
   } catch (error) {
     return {
       alive: false,
@@ -110,9 +90,7 @@ export default async function handler(req, res) {
       ? (typeof currentRoomRaw === 'string' ? JSON.parse(currentRoomRaw) : currentRoomRaw)
       : null;
 
-    // =========================================================================
-    // 1. 开启放歌 (start) - 官方级极速验房
-    // =========================================================================
+    // 1. 开启放歌 (start)
     if (action === 'start') {
       const roomOwner = currentRoom ? (currentRoom.publisher || currentRoom.inviter) : null;
       if (currentRoom && roomOwner !== username) {
@@ -126,7 +104,6 @@ export default async function handler(req, res) {
         return res.status(400).json({ code: 400, message: '缺少房间链接或房间号' });
       }
 
-      // 🌟 执行真实验房（毫秒级判断真伪与存活）
       const probeResult = await probeNeriRoomOnCloud(serverUrl, roomId, secret);
       if (!probeResult.alive) {
         return res.status(400).json({
@@ -139,7 +116,6 @@ export default async function handler(req, res) {
       let mongoLogId = null;
       const now = new Date();
 
-      // 写入 MongoDB 归档日志（容错降级，即便数据库偶发抖动也不阻断业务）
       try {
         const db = await getDatabase();
         const users = db.collection('users');
@@ -163,10 +139,9 @@ export default async function handler(req, res) {
         });
         mongoLogId = insertResult.insertedId.toString();
       } catch (err) {
-        console.warn('[MongoDB 警告] 记录日志失败，继续放歌业务:', err.message);
+        console.warn('[MongoDB 警告] 记录日志失败:', err.message);
       }
 
-      // 写入 Redis 广播，带 30 秒自动过期租约
       const newRoomPayload = {
         roomId,
         inviter: inviter || username,
@@ -174,7 +149,9 @@ export default async function handler(req, res) {
         hostAvatarUrl,
         secret: secret || '',
         deepLink,
+        serverUrl: serverUrl || '',
         mongoLogId,
+        lastProbedAt: now.getTime(),
         updatedAt: Math.floor(now.getTime() / 1000)
       };
 
@@ -189,9 +166,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // =========================================================================
-    // 2. 房主心跳续期 (heartbeat)
-    // =========================================================================
+    // 2. 房主心跳 (heartbeat)
     if (action === 'heartbeat') {
       const roomOwner = currentRoom ? (currentRoom.publisher || currentRoom.inviter) : null;
       if (currentRoom && roomOwner === username) {
@@ -204,9 +179,7 @@ export default async function handler(req, res) {
       return res.status(404).json({ code: 404, message: '房间已失效或不是房主' });
     }
 
-    // =========================================================================
     // 3. 关闭房间 (stop / expire)
-    // =========================================================================
     if (action === 'stop' || action === 'expire') {
       const roomOwner = currentRoom ? (currentRoom.publisher || currentRoom.inviter) : null;
       if (currentRoom && roomOwner === username) {
