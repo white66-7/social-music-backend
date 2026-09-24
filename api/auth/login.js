@@ -55,7 +55,7 @@ export default async function handler(req, res) {
         await redis.expire(failRateKey, 600);
         return res.status(403).json({ 
           code: 403, 
-          message: '该 QQ 已绑定口令，口令错误！' 
+          message: '口令错误' 
         });
       }
 
