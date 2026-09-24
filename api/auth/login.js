@@ -1,63 +1,5 @@
+// pages/api/auth/login.js
 import { redis } from '../../lib/redis.js';
-
-// 封装可靠的 QQ 昵称抓取函数（双通道 + 超时熔断）
-async function fetchQqNickname(cleanQq) {
-  // 渠道 1：腾讯官方接口（带 Referer 伪装）
-  try {
-    const qzoneResp = await fetch(
-      `https://r.qzone.qq.com/fcg-bin/cgi_get_portrait.fcg?uins=${cleanQq}`,
-      {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Referer': 'https://qzone.qq.com/'
-        },
-        signal: AbortSignal.timeout(3000)
-      }
-    );
-
-    if (qzoneResp.ok) {
-      const buf = await qzoneResp.arrayBuffer();
-      let text = '';
-      try {
-        text = new TextDecoder('gbk').decode(buf);
-      } catch (_) {
-        text = new TextDecoder('utf-8').decode(buf);
-      }
-
-      // 正确提取 portraitCallBack(...) 内的 JSON 并解析
-      const jsonMatch = text.match(/portraitCallBack\(([\s\S]*?)\);?/);
-      if (jsonMatch && jsonMatch[1]) {
-        const data = JSON.parse(jsonMatch[1]);
-        // 腾讯接口第 6 项即为昵称
-        const nick = data[cleanQq]?.[6];
-        if (nick && typeof nick === 'string' && nick.trim()) {
-          return nick.trim();
-        }
-      }
-    }
-  } catch (e) {
-    console.warn('[官方接口拉取失败，尝试备用通道]:', e.message);
-  }
-
-  // 渠道 2：公共备用 API（防止 Vercel 海外服务器 IP 被腾讯拦截）
-  try {
-    const backupResp = await fetch(`https://api.usuuu.com/qq/${cleanQq}`, {
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-      signal: AbortSignal.timeout(3000)
-    });
-    if (backupResp.ok) {
-      const resData = await backupResp.json();
-      const nick = resData?.data?.name;
-      if (nick && typeof nick === 'string' && nick.trim()) {
-        return nick.trim();
-      }
-    }
-  } catch (e) {
-    console.warn('[备用通道拉取失败]:', e.message);
-  }
-
-  return `QQ用户_${cleanQq}`;
-}
 
 export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
@@ -85,19 +27,16 @@ export default async function handler(req, res) {
     if (userRaw) {
       const existingUser = typeof userRaw === 'string' ? JSON.parse(userRaw) : userRaw;
 
-      // 容错：如果之前测试的数据没有 pin，直接补绑当前口令
+      // 口令校验与容错
       if (!existingUser.pin) {
         existingUser.pin = cleanPin;
       } else if (existingUser.pin !== cleanPin) {
         return res.status(403).json({ code: 403, message: '该 QQ 已绑定专属口令，口令错误！' });
       }
 
-      // ★ 关键修复：如果老数据之前存成了默认的 "QQ用户_xxx"，本次登录自动重新抓取并更新 Redis！
-      if (!existingUser.username || existingUser.username.startsWith('QQ用户_')) {
-        const realNick = await fetchQqNickname(cleanQq);
-        if (realNick && !realNick.startsWith('QQ用户_')) {
-          existingUser.username = realNick;
-        }
+      // 自动清洗：把之前测试残留的难看名字 "QQ用户_xxxx" 自动转为清爽的 "音乐人_后四位"
+      if (existingUser.username && existingUser.username.startsWith('QQ用户_')) {
+        existingUser.username = `音乐人_${cleanQq.slice(-4)}`;
       }
 
       existingUser.lastActiveAt = Date.now();
@@ -111,13 +50,14 @@ export default async function handler(req, res) {
       });
     }
 
-    // 2. 新成员首次认证：安全拉取真实昵称
-    const nickname = await fetchQqNickname(cleanQq);
+    // 2. 新成员首次认证：秒级创建，默认昵称 + 官方高清头像
+    const shortQq = cleanQq.slice(-4);
+    const defaultNickname = `音乐人_${shortQq}`;
     const avatarUrl = `https://q1.qlogo.cn/g?b=qq&nk=${cleanQq}&s=640`;
 
     const newUser = {
       qq: cleanQq,
-      username: nickname,
+      username: defaultNickname,
       avatarUrl: avatarUrl,
       pin: cleanPin,
       createdAt: Date.now(),
@@ -134,7 +74,7 @@ export default async function handler(req, res) {
     });
 
   } catch (error) {
-    console.error('[Login Fatal Error]', error);
+    console.error('[Login Error]', error);
     return res.status(500).json({ code: 500, message: `服务器处理异常: ${error.message}` });
   }
 }
