@@ -1,5 +1,5 @@
 import { redis, REDIS_ROOM_KEY, loadRoom, renewRoom } from '../../lib/redis.js';
-import { verifyRoomSecret } from '../../lib/neri.js';
+import { checkRoomExists, verifyRoomSecret } from '../../lib/neri.js';
 import { getDatabase } from '../../lib/mongodb.js';
 import { ObjectId } from 'mongodb';
 
@@ -10,7 +10,7 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { action, username, roomId, inviter, publisher, secret, deepLink, serverUrl } = req.body || {};
+    const { action, username, roomId, inviter, publisher, secret, deepLink, serverUrl, resume } = req.body || {};
 
     if (!action) {
       return res.status(400).json({ code: 400, message: '缺少 action 参数' });
@@ -31,11 +31,23 @@ export default async function handler(req, res) {
         return res.status(400).json({ code: 400, message: '缺少房间链接或房间号' });
       }
 
-      // 开播前唯一一次真核验：需要真的用 joinSecret 加入才能确认密钥正确。
+      // 第一次开播要做真核验：只有真的用 joinSecret 加入一次才能确认密钥正确。
       // 这会触发 NeriPlayer 的 autoPauseOnMemberChange（加入 + 退出各暂停一次），
       // 但此刻房间刚建、还没有听众，只影响房主自己，可以接受。
       // ⚠️ 绝不要把这条路径挪到轮询里，轮询必须用 lib/neri.js 的 checkRoomExists。
-      const probeResult = await verifyRoomSecret(serverUrl, roomId, secret);
+      //
+      // resume=true 是「息屏/后台被回收后回来自动重播」走的路：密钥在首次开播时已经
+      // 验过了，这里只做只读的存在性检查，免得房主每次息屏回来都把正在听歌的人暂停一次。
+      let probeResult;
+      if (resume) {
+        const exists = await checkRoomExists(serverUrl, roomId);
+        probeResult = exists === 'dead'
+          ? { ok: false, message: '房间已关闭或不存在，无法恢复' }
+          // 'unknown'（探测超时/不可达）倾向放行，避免网络抖动反而把房间弄丢
+          : { ok: true };
+      } else {
+        probeResult = await verifyRoomSecret(serverUrl, roomId, secret);
+      }
       if (!probeResult.ok) {
         return res.status(400).json({ code: 400, message: probeResult.message });
       }
@@ -57,18 +69,30 @@ export default async function handler(req, res) {
           if (host?.avatarUrl) hostAvatarUrl = host.avatarUrl;
         }
 
-        const insertResult = await db.collection('room_logs').insertOne({
-          roomId,
-          publisher: username,
-          inviter: inviter || username,
-          hostAvatarUrl, // 与 GET /api/room/history 的投影字段对齐，否则历史记录头像恒为空
-          deepLink,
-          status: 'active',
-          startedAt: now,
-          endedAt: null,
-          endReason: null,
-        });
-        mongoLogId = insertResult.insertedId.toString();
+        // 恢复同一个房间时复用原来那条「进行中」的历史记录，
+        // 否则房主每息屏一次 /api/room/history 里就会多出一条重复记录
+        if (resume) {
+          const existing = await db.collection('room_logs').findOne(
+            { roomId, publisher: username, status: 'active' },
+            { sort: { startedAt: -1 }, projection: { _id: 1 } }
+          );
+          if (existing) mongoLogId = existing._id.toString();
+        }
+
+        if (!mongoLogId) {
+          const insertResult = await db.collection('room_logs').insertOne({
+            roomId,
+            publisher: username,
+            inviter: inviter || username,
+            hostAvatarUrl, // 与 GET /api/room/history 的投影字段对齐，否则历史记录头像恒为空
+            deepLink,
+            status: 'active',
+            startedAt: now,
+            endedAt: null,
+            endReason: null,
+          });
+          mongoLogId = insertResult.insertedId.toString();
+        }
       } catch (err) {
         console.warn('[MongoDB 警告] 记录日志失败:', err.message);
       }
