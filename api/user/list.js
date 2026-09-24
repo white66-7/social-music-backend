@@ -11,9 +11,21 @@ export default async function handler(req, res) {
     //并发查询：同时去 MongoDB 查成员 和 Redis 查当前房间房主（大幅缩短响应时间）
     const dbPromise = getDatabase().then(db =>
       db.collection('users')
-        .find({})
-        .project({ pin: 0 })  // 🔒 数据库层直接剔除 pin，避免泄露且减小网络传输包体
-        .sort({ lastActiveAt: -1 }) // 直接在数据库层按最后活跃时间倒序
+        .aggregate([
+          // 迁移后以 qq 为唯一身份键，过滤掉历史遗留的无 qq 脏档案
+          { $match: { qq: { $type: 'string', $ne: '' } } },
+          // lastActiveAt 曾在 Date 与毫秒时间戳之间混用；统一转成数字再排序，
+          // 否则 BSON 类型序会把数字型全部排在日期型之前，活跃时间排序失效
+          {
+            $addFields: {
+              lastActiveAt: {
+                $convert: { input: '$lastActiveAt', to: 'long', onError: 0, onNull: 0 }
+              }
+            }
+          },
+          { $project: { pin: 0 } }, // 🔒 数据库层直接剔除 pin，避免泄露且减小网络传输包体
+          { $sort: { lastActiveAt: -1 } } // 直接在数据库层按最后活跃时间倒序
+        ])
         .toArray()
     );
 

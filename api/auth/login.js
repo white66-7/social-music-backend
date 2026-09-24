@@ -44,10 +44,13 @@ export default async function handler(req, res) {
     const existingUser = await usersCollection.findOne({ qq: cleanQq });
 
     if (existingUser) {
-      // 兼容老明文数据与新 Bcrypt 哈希数据
-      const isMatch = existingUser.pin.startsWith('$2')
-        ? await bcrypt.compare(cleanPin, existingUser.pin)
-        : existingUser.pin === cleanPin;
+      // 兼容老明文数据与新 Bcrypt 哈希数据；
+      // pin 缺失说明档案是被 sync / 改名接口预先登记的（迁移前的老数据），按首次绑定处理
+      const storedPin = typeof existingUser.pin === 'string' ? existingUser.pin : '';
+      const isFirstBind = storedPin.length === 0;
+      const isMatch = isFirstBind || (storedPin.startsWith('$2')
+        ? await bcrypt.compare(cleanPin, storedPin)
+        : storedPin === cleanPin);
 
       if (!isMatch) {
         // 口令错误，Redis 累计失败次数并设置 10 分钟过期
@@ -62,9 +65,9 @@ export default async function handler(req, res) {
       // 登录成功，清除试错记录
       await redis.del(failRateKey);
 
-      // 如果原来存的是明文口令，顺手升级为加盐密文，并刷新活跃时间
+      // 首次绑定、或原来存的是明文口令，顺手升级为加盐密文，并刷新活跃时间
       const updateData = { lastActiveAt: Date.now() };
-      if (!existingUser.pin.startsWith('$2')) {
+      if (isFirstBind || !storedPin.startsWith('$2')) {
         updateData.pin = await bcrypt.hash(cleanPin, 10);
       }
 
@@ -85,7 +88,7 @@ export default async function handler(req, res) {
 
       return res.status(200).json({
         code: 0,
-        message: '登录成功',
+        message: isFirstBind ? '首次认证并绑定成功' : '登录成功',
         token, 
         user: safeUser
       });

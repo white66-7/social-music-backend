@@ -114,11 +114,22 @@ export default async function handler(req, res) {
 
       try {
         const db = await getDatabase();
-        const roomLogs = db.collection('room_logs');
-        const insertResult = await roomLogs.insertOne({
+
+        // 🌟 用户档案已迁至 MongoDB：按 QQ / 昵称双通道命中房主头像
+        if (username) {
+          const key = String(username);
+          const host = await db.collection('users').findOne(
+            { $or: [{ qq: key }, { username: key }] },
+            { projection: { avatarUrl: 1 } }
+          );
+          if (host?.avatarUrl) hostAvatarUrl = host.avatarUrl;
+        }
+
+        const insertResult = await db.collection('room_logs').insertOne({
           roomId,
           publisher: username,
           inviter: inviter || username,
+          hostAvatarUrl, // 与 GET /api/room/history 的投影字段对齐，否则历史记录头像恒为空
           deepLink,
           status: 'active',
           startedAt: now,
@@ -129,16 +140,6 @@ export default async function handler(req, res) {
       } catch (err) {
         console.warn('[MongoDB 警告] 记录日志失败:', err.message);
       }
-
-      // 从 Redis 成员列表中抓取该用户的头像
-      try {
-        const rawMembers = await redis.hvals('app:circle_members');
-        const list = (rawMembers || []).map(m => typeof m === 'string' ? JSON.parse(m) : m);
-        const match = list.find(u => u.username === username || u.qq === username);
-        if (match?.avatarUrl) {
-          hostAvatarUrl = match.avatarUrl;
-        }
-      } catch (_) {}
 
       const newRoomPayload = {
         roomId,
