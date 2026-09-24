@@ -5,14 +5,12 @@ import { ObjectId } from 'mongodb';
 
 const ROOM_LEASE_SECONDS = 30;
 
-
 function probeNeriRoomOnCloud(serverUrl, roomId, secret, timeoutMs = 4000) {
   return new Promise((resolve) => {
     let isSettled = false;
     let timer = null;
     let ws = null;
 
-    // 核心安全清理函数：彻底杜绝 Uncaught Exception
     const finish = (result) => {
       if (isSettled) return;
       isSettled = true;
@@ -24,12 +22,11 @@ function probeNeriRoomOnCloud(serverUrl, roomId, secret, timeoutMs = 4000) {
 
       if (ws) {
         try {
-          // 1. 先清空之前的监听器
           ws.removeAllListeners();
-          // 2. 🌟 关键修复：挂载空函数接盘，防止 terminate 触发未捕获的 'error' 导致进程崩溃
-          ws.on('error', () => {});
+          ws.on('error', () => {}); // 挂载空函数接盘，防止 terminate 产生未捕获异常
 
           if (ws.readyState === WebSocket.OPEN) {
+            // 采用 1000 标准正常关闭，绝不打扰听众
             ws.close(1000, 'Probe Completed');
           } else {
             ws.terminate();
@@ -41,17 +38,15 @@ function probeNeriRoomOnCloud(serverUrl, roomId, secret, timeoutMs = 4000) {
     };
 
     try {
-      // 1. 规范化地址
+      // 1. 规范化地址并转为 wss:// 协议
       let base = (serverUrl || 'https://neriplayer.hancat.work').trim();
       if (!/^https?:\/\//i.test(base) && !/^wss?:\/\//i.test(base)) {
         base = 'https://' + base;
       }
 
-      const wsUrl = new URL(base);
-      wsUrl.protocol = wsUrl.protocol === 'http:' ? 'ws:' : 'wss:';
-      if (!wsUrl.pathname || wsUrl.pathname === '/') {
-        wsUrl.pathname = '/';
-      }
+      const parsed = new URL(base);
+      const wsUrl = new URL(parsed.pathname === '/' ? '' : parsed.pathname, `wss://${parsed.host}`);
+      
       wsUrl.searchParams.set('roomId', roomId);
       if (secret) {
         wsUrl.searchParams.set('secret', secret);
@@ -67,77 +62,81 @@ function probeNeriRoomOnCloud(serverUrl, roomId, secret, timeoutMs = 4000) {
         });
       }, timeoutMs);
 
-      // 3. 发起 WebSocket 请求（模拟 Android 客户端请求头）
+      // 3. 发起 WebSocket 请求（模拟 Android 原生 OkHttp，坚决不带 Origin: null！）
       ws = new WebSocket(wsUrl.toString(), {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Linux; Android 10) NeriPlayer/1.0',
-          'Origin': wsUrl.origin.replace(/^ws/, 'http')
+          'Accept-Language': 'zh-CN,zh;q=0.9',
+          'Cache-Control': 'no-cache',
+          'Pragma': 'no-cache'
+          // 注意：绝不传 Origin 字段，与 Android 播放器底层保持完全一致
         },
         handshakeTimeout: 3000
       });
 
-      // 4. 监听 HTTP 响应异常（重点：读取 200/403/404 的实际响应内容）
+      // 4. 监听 HTTP 状态异常
       ws.on('unexpected-response', (req, res) => {
         let respBody = '';
-        res.on('data', (chunk) => {
-          respBody += chunk;
-        });
+        res.on('data', chunk => { respBody += chunk; });
         res.on('end', () => {
           const status = res.statusCode || 500;
-          console.error(`[Probe 异常响应] 状态码: ${status}, 内容摘要: ${respBody.slice(0, 150)}`);
+          console.error(`[Probe 拦截] HTTP ${status}: ${respBody.slice(0, 150)}`);
 
-          let msg = `服务端未建立连接 (HTTP ${status})`;
+          let msg = `服务端拒绝连接 (HTTP ${status})`;
           if (status === 200) {
-            msg = '房间节点未开启 WebSocket 或返回了普通网页';
+            msg = '未能成功升级到 WebSocket，请确认房间参数';
           } else if (status === 404) {
-            msg = '该房间不存在或已解散 (404)';
+            msg = '房间号不存在或房主已离开 (404)';
           } else if (status === 403 || status === 401) {
-            msg = '房间密钥无效或拒绝加入 (403)';
+            msg = '房间口令/密钥错误 (403)';
+          } else if (status === 400) {
+            msg = '房间参数错误 (400)';
           }
 
           finish({ alive: false, code: status, message: msg });
         });
       });
 
-      // 5. 监听网络层错误
+      // 5. 监听网络层故障
       ws.on('error', (err) => {
         finish({
           alive: false,
           code: -1,
-          message: `连接失败: ${err.message || '网络不可达'}`
+          message: `节点不可达: ${err.message || '网络异常'}`
         });
       });
 
-      // 6. 监听关闭事件
+      // 6. 监听业务鉴权踢出（code: 1008/4xxx）
       ws.on('close', (code, reason) => {
         const reasonText = reason ? reason.toString() : '';
         if (code === 1008 || code >= 4000) {
           finish({
             alive: false,
             code,
-            message: `房间拒绝: ${reasonText || '口令无效'}`
+            message: `房间安全拒绝 (${code}): ${reasonText || '口令无效'}`
           });
         } else if (code !== 1000) {
           finish({
             alive: false,
             code,
-            message: `连接中断 (code ${code}): ${reasonText}`
+            message: `连接被异常中断 (code ${code}): ${reasonText}`
           });
         }
       });
 
-      // 7. 握手成功并保持片刻
+      // 7. 握手成功（收到 HTTP 101 Switching Protocols）
       ws.on('open', () => {
+        // 留出 350ms 缓冲防鉴权秒踢
         setTimeout(() => {
-          finish({ alive: true, code: 0, message: '房间正常存活' });
-        }, 300);
+          finish({ alive: true, code: 0, message: '房间正常存活且口令有效' });
+        }, 350);
       });
 
     } catch (e) {
       finish({
         alive: false,
         code: -2,
-        message: `探活参数异常: ${e.message}`
+        message: `探活初始化异常: ${e.message}`
       });
     }
   });
