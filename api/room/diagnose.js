@@ -1,103 +1,86 @@
-import WebSocket from 'ws';
-
-function testPathWithRoom(path, roomId, secret) {
-  return new Promise((resolve) => {
-    let ws = null;
-    let timer = null;
-    let isDone = false;
-
-    const finish = (res) => {
-      if (!isDone) {
-        isDone = true;
-        if (timer) clearTimeout(timer);
-        if (ws) {
-          try {
-            ws.removeAllListeners();
-            ws.on('error', () => {});
-            ws.close(1000, 'Done');
-          } catch (_) {}
-        }
-        resolve({ path, ...res });
-      }
-    };
-
-    try {
-      // 路径和 Query 双保险携带参数
-      const url = `wss://neriplayer.hancat.work${path}?secret=${encodeURIComponent(secret)}&nickname=DiagBot&roomId=${encodeURIComponent(roomId)}`;
-
-      ws = new WebSocket(url, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Linux; Android 10) NeriPlayer/1.0' },
-        handshakeTimeout: 3000
-      });
-
-      timer = setTimeout(() => {
-        finish({ status: 'TIMEOUT', message: '连接超时' });
-      }, 3500);
-
-      // 握手成功
-      ws.on('open', () => {
-        finish({
-          status: 'OPEN_SUCCESS',
-          hit: true,
-          message: '🎉 100% 命中！成功升级为 WebSocket (101 Switching Protocols)！'
-        });
-      });
-
-      ws.on('unexpected-response', (req, res) => {
-        let body = '';
-        res.on('data', c => { body += c; });
-        res.on('end', () => {
-          finish({
-            status: `HTTP_${res.statusCode}`,
-            hit: false,
-            body: body.trim()
-          });
-        });
-      });
-
-      ws.on('close', (code, reason) => {
-        finish({
-          status: 'CLOSED_BY_SERVER',
-          hit: code === 1000,
-          code,
-          reason: reason ? reason.toString() : ''
-        });
-      });
-
-      ws.on('error', err => {
-        finish({ status: 'ERROR', hit: false, error: err.message });
-      });
-
-    } catch (e) {
-      finish({ status: 'EXCEPTION', hit: false, error: e.message });
-    }
-  });
-}
-
 export default async function handler(req, res) {
   const roomId = req.query.roomId || 'QUYUDY';
-  const secret = req.query.secret || '';
+  const secret = req.query.secret || 'eD28BpOuYIYSXS6NUy3AN4a1jf2QgKOTz0dMGsOtS8I';
+  const server = 'https://neriplayer.hancat.work';
 
-  // 待测试的动态路径格式
-  const candidatePatterns = [
-    `/${roomId}`,                 // 格式 1: /QUYUDY (最主流)
-    `/room/${roomId}`,            // 格式 2: /room/QUYUDY
-    `/rooms/${roomId}`,           // 格式 3: /rooms/QUYUDY
-    `/ws/${roomId}`,              // 格式 4: /ws/QUYUDY
-    `/join/${roomId}`,            // 格式 5: /join/QUYUDY
-    `/listen-together/${roomId}`  // 格式 6: /listen-together/QUYUDY
+  // 待检测的 HTTP 候选端点列表（GET 与 POST）
+  const candidates = [
+    // 常见 GET 查询参数
+    { method: 'GET', path: `/api/room/state?roomId=${roomId}&secret=${secret}` },
+    { method: 'GET', path: `/api/room/state?roomId=${roomId}` },
+    { method: 'GET', path: `/api/room?roomId=${roomId}&secret=${secret}` },
+    { method: 'GET', path: `/api/room?roomId=${roomId}` },
+    { method: 'GET', path: `/room/state?roomId=${roomId}&secret=${secret}` },
+    { method: 'GET', path: `/room/state?roomId=${roomId}` },
+    { method: 'GET', path: `/room?roomId=${roomId}&secret=${secret}` },
+    { method: 'GET', path: `/room?roomId=${roomId}` },
+    { method: 'GET', path: `/state?roomId=${roomId}&secret=${secret}` },
+    { method: 'GET', path: `/state?roomId=${roomId}` },
+    { method: 'GET', path: `/?roomId=${roomId}&action=refresh` },
+    { method: 'GET', path: `/?roomId=${roomId}&action=state` },
+
+    // 常见 RESTful 路径参数
+    { method: 'GET', path: `/api/room/${roomId}/state?secret=${secret}` },
+    { method: 'GET', path: `/api/room/${roomId}?secret=${secret}` },
+    { method: 'GET', path: `/room/${roomId}/state?secret=${secret}` },
+    { method: 'GET', path: `/room/${roomId}?secret=${secret}` },
+    { method: 'GET', path: `/${roomId}/state?secret=${secret}` },
+
+    // 常见 POST 请求
+    { method: 'POST', path: `/api/room/state`, body: { roomId, secret } },
+    { method: 'POST', path: `/api/room/refresh`, body: { roomId, secret } },
+    { method: 'POST', path: `/room/state`, body: { roomId, secret } },
+    { method: 'POST', path: `/refresh`, body: { roomId, secret } },
+    { method: 'POST', path: `/`, body: { action: 'refresh', roomId, secret } }
   ];
 
   const results = await Promise.all(
-    candidatePatterns.map(p => testPathWithRoom(p, roomId, secret))
+    candidates.map(async (item) => {
+      try {
+        const url = `${server}${item.path}`;
+        const options = {
+          method: item.method,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 10) NeriPlayer/1.0',
+            'Accept': 'application/json'
+          },
+          signal: AbortSignal.timeout(3000)
+        };
+        if (item.body) {
+          options.headers['Content-Type'] = 'application/json';
+          options.body = JSON.stringify(item.body);
+        }
+
+        const resp = await fetch(url, options);
+        const text = await resp.text();
+        let json = null;
+        try { json = JSON.parse(text); } catch (_) {}
+
+        // 判断是否命中：返回 JSON 包含 ok: true，且包含 version 或 members 字段
+        const isHit = json && json.ok === true && (json.version !== undefined || json.members !== undefined || json.expectedPositionMs !== undefined);
+
+        return {
+          endpoint: `${item.method} ${item.path}`,
+          status: resp.status,
+          hit: isHit,
+          data: json || text.slice(0, 150)
+        };
+      } catch (err) {
+        return {
+          endpoint: `${item.method} ${item.path}`,
+          error: err.message
+        };
+      }
+    })
   );
 
-  const matched = results.find(r => r.status === 'OPEN_SUCCESS');
+  const hitItem = results.find(r => r.hit);
 
   return res.status(200).json({
-    conclusion: matched 
-      ? `🎉 彻底破案！真实端点是：${matched.path}` 
-      : '未命中成功端点，查看各项返回状态码',
-    results
+    conclusion: hitItem 
+      ? `🎉 抓到了！NeriPlayer 的真实 HTTP 探针接口是：${hitItem.endpoint}`
+      : '未自动匹配到，请查看各项响应数据',
+    hitEndpoint: hitItem || null,
+    scanResults: results
   });
 }
