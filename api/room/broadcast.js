@@ -97,7 +97,8 @@ export default async function handler(req, res) {
         secret: secret || '',
         deepLink,
         serverUrl: serverUrl || '',
-        currentSong: probeResult.currentSong || null, // 👈 存入 Redis
+        currentSong: probeResult.currentSong || null, 
+        currentCover: probeResult.currentCover || null,
         mongoLogId,
         lastProbedAt: now.getTime(),
         lastHeartbeatAt: now.getTime(),
