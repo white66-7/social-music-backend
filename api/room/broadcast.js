@@ -31,23 +31,18 @@ export default async function handler(req, res) {
         return res.status(400).json({ code: 400, message: '缺少房间链接或房间号' });
       }
 
-      // 第一次开播要做真核验：只有真的用 joinSecret 加入一次才能确认密钥正确。
-      // 这会触发 NeriPlayer 的 autoPauseOnMemberChange（加入 + 退出各暂停一次），
-      // 但此刻房间刚建、还没有听众，只影响房主自己，可以接受。
-      // ⚠️ 绝不要把这条路径挪到轮询里，轮询必须用 lib/neri.js 的 checkRoomExists。
-      //
-      // resume=true 是「息屏/后台被回收后回来自动重播」走的路：密钥在首次开播时已经
-      // 验过了，这里只做只读的存在性检查，免得房主每次息屏回来都把正在听歌的人暂停一次。
+      // 第一次开播要做真核验：加入房间验证密钥并获取当前歌曲
+      // resume=true 是息屏重连逻辑，复用已有歌名，避免打扰听众
       let probeResult;
       if (resume) {
         const exists = await checkRoomExists(serverUrl, roomId);
         probeResult = exists === 'dead'
           ? { ok: false, message: '房间已关闭或不存在，无法恢复' }
-          // 'unknown'（探测超时/不可达）倾向放行，避免网络抖动反而把房间弄丢
-          : { ok: true };
+          : { ok: true, currentSong: currentRoom?.currentSong || null };
       } else {
         probeResult = await verifyRoomSecret(serverUrl, roomId, secret);
       }
+
       if (!probeResult.ok) {
         return res.status(400).json({ code: 400, message: probeResult.message });
       }
@@ -59,7 +54,6 @@ export default async function handler(req, res) {
       try {
         const db = await getDatabase();
 
-        // 🌟 用户档案已迁至 MongoDB：按 QQ / 昵称双通道命中房主头像
         if (username) {
           const key = String(username);
           const host = await db.collection('users').findOne(
@@ -69,8 +63,6 @@ export default async function handler(req, res) {
           if (host?.avatarUrl) hostAvatarUrl = host.avatarUrl;
         }
 
-        // 恢复同一个房间时复用原来那条「进行中」的历史记录，
-        // 否则房主每息屏一次 /api/room/history 里就会多出一条重复记录
         if (resume) {
           const existing = await db.collection('room_logs').findOne(
             { roomId, publisher: username, status: 'active' },
@@ -84,7 +76,7 @@ export default async function handler(req, res) {
             roomId,
             publisher: username,
             inviter: inviter || username,
-            hostAvatarUrl, // 与 GET /api/room/history 的投影字段对齐，否则历史记录头像恒为空
+            hostAvatarUrl,
             deepLink,
             status: 'active',
             startedAt: now,
@@ -105,6 +97,7 @@ export default async function handler(req, res) {
         secret: secret || '',
         deepLink,
         serverUrl: serverUrl || '',
+        currentSong: probeResult.currentSong || null, // 👈 存入 Redis
         mongoLogId,
         lastProbedAt: now.getTime(),
         lastHeartbeatAt: now.getTime(),
@@ -126,7 +119,6 @@ export default async function handler(req, res) {
         const now = Date.now();
         currentRoom.updatedAt = Math.floor(now / 1000);
         currentRoom.lastHeartbeatAt = now;
-        // 心跳负责续租，这是房间存活的唯一依据
         await renewRoom(currentRoom);
         return res.status(200).json({ code: 0, message: '续期成功' });
       }

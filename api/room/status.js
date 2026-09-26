@@ -71,6 +71,7 @@ export default async function handler(req, res) {
       hostAvatarUrl: currentRoom.hostAvatarUrl,
       deepLink: currentRoom.deepLink,
       roomId: currentRoom.roomId,
+      currentSong: currentRoom.currentSong || null,
     });
   } catch (error) {
     console.error('[Room Status API Error]', error);
