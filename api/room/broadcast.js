@@ -31,14 +31,21 @@ export default async function handler(req, res) {
         return res.status(400).json({ code: 400, message: '缺少房间链接或房间号' });
       }
 
-      // 第一次开播要做真核验：加入房间验证密钥并获取当前歌曲
-      // resume=true 是息屏重连逻辑，复用已有歌名，避免打扰听众
       let probeResult;
       if (resume) {
         const exists = await checkRoomExists(serverUrl, roomId);
         probeResult = exists === 'dead'
           ? { ok: false, message: '房间已关闭或不存在，无法恢复' }
-          : { ok: true, currentSong: currentRoom?.currentSong || null };
+          : {
+              ok: true,
+              currentSong: currentRoom?.currentSong || null,
+              currentCover: currentRoom?.currentCover || null,
+              durationMs: currentRoom?.durationMs || 0,
+              basePositionMs: currentRoom?.basePositionMs || 0,
+              baseTimestampMs: currentRoom?.baseTimestampMs || Date.now(),
+              playbackRate: currentRoom?.playbackRate || 1,
+              isPlaying: currentRoom?.isPlaying ?? true,
+            };
       } else {
         probeResult = await verifyRoomSecret(serverUrl, roomId, secret);
       }
@@ -99,8 +106,14 @@ export default async function handler(req, res) {
         serverUrl: serverUrl || '',
         currentSong: probeResult.currentSong || null, 
         currentCover: probeResult.currentCover || null,
+        durationMs: probeResult.durationMs || 0,
+        basePositionMs: probeResult.basePositionMs || 0,
+        baseTimestampMs: probeResult.baseTimestampMs || now.getTime(),
+        playbackRate: probeResult.playbackRate || 1,
+        isPlaying: probeResult.isPlaying ?? true,
         mongoLogId,
         lastProbedAt: now.getTime(),
+        lastStateSyncAt: now.getTime(),
         lastHeartbeatAt: now.getTime(),
         updatedAt: Math.floor(now.getTime() / 1000)
       };
