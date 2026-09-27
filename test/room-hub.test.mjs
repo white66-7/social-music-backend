@@ -148,5 +148,17 @@ const before = ctx.sockets[0].sent.length;
 await hub.fetch(post('/host/stop', { user: A }));
 check('没有多余广播', ctx.sockets[0].sent.length === before);
 
+console.log('\n[10] 静态约束：DO 不得引入跨 I/O 上下文的依赖');
+// Durable Object 与 Worker 同 isolate 但属于不同 I/O 上下文。
+// 之前 DO 里调 getDatabase() 复用了 Worker 建立的 Mongo 连接，线上表现为
+// 「Cannot perform I/O on behalf of a different Durable Object」以及请求永久挂住。
+// 这条测试就是防止那个 bug 被重新引入。
+const { readFileSync } = await import('node:fs');
+const hubSource = readFileSync(new URL('../src/room-hub.js', import.meta.url), 'utf8');
+check('room-hub.js 不 import mongodb', !/from ['"]mongodb['"]/.test(hubSource));
+check('room-hub.js 不 import getDatabase', !/getDatabase/.test(hubSource));
+check('room-hub.js 不 import redis', !/lib\/redis/.test(hubSource));
+check('room-hub.js 不做任何出站 fetch', !/\.fetch\(['"]https?:/.test(hubSource));
+
 console.log(`\n${failures === 0 ? '全部通过' : failures + ' 项失败'}`);
 process.exit(failures === 0 ? 0 : 1);

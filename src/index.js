@@ -45,9 +45,81 @@ app.use('*', async (c, next) => {
 
 app.get('/api/health', (c) => c.json({ code: 0, message: 'ok', time: Date.now() }, 200));
 
-// 房间日志由 RoomHub 在校验完房间归属之后写入 —— 放在这里写的话，
-// 任何人拿别人正在放歌的 roomId 反复调 start 就能覆盖那条房间历史的发布者。
+// ----------------------------------------------------
+// 房间历史
+//
+// 这些操作必须留在 Worker 侧：Durable Object 与本 Worker 跑在同一个 isolate
+// 但属于不同的 I/O 上下文，DO 里复用 Worker 建立的 Mongo 连接会直接抛
+// "Cannot perform I/O on behalf of a different Durable Object"，或者让请求永久挂住。
+//
+// 顺序上同样要小心：日志一律在 RoomHub 校验通过之后才写，
+// 否则任何人拿别人正在放歌的 roomId 反复调 start 就能改写那条历史。
+// ----------------------------------------------------
+async function openRoomLog(env, { roomId, publisher, inviter, hostAvatarUrl, deepLink }) {
+  const now = new Date();
+  try {
+    const db = await getDatabase(env);
+    await db.collection('room_logs').findOneAndUpdate(
+      { roomId },
+      {
+        $set: {
+          publisher,
+          inviter,
+          hostAvatarUrl,
+          deepLink,
+          status: 'active',
+          startedAt: now,
+          endedAt: null,
+          endReason: null
+        },
+        $setOnInsert: { createdAt: now }
+      },
+      { upsert: true }
+    );
+  } catch (e) {
+    console.warn('[Room Log] 写入失败（不影响开播）:', e.message);
+  }
+}
 
+/**
+ * 收尾当前活动房间的历史记录。
+ * 全站同时只允许一个房间，所以不需要 roomId 也能精确定位。
+ */
+async function endActiveRoomLog(env, reason) {
+  try {
+    const db = await getDatabase(env);
+    await db.collection('room_logs').updateMany(
+      { status: 'active' },
+      {
+        $set: {
+          status: 'ended',
+          endedAt: new Date(),
+          endReason: reason === 'timeout' ? 'timeout' : 'manual'
+        }
+      }
+    );
+  } catch (e) {
+    console.warn('[Room Log] 归档失败:', e.message);
+  }
+}
+
+/**
+ * 房主超时被 DO 回收时，DO 没有回调 Worker 的通道，那条历史会一直挂在 active。
+ * 所以在「服务端确认没有房间」时顺手收尾一次，并节流避免每个请求都写库。
+ */
+let lastStaleSweepAt = 0;
+const STALE_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+
+async function sweepStaleRoomLogs(env) {
+  const now = Date.now();
+  if (now - lastStaleSweepAt < STALE_SWEEP_INTERVAL_MS) return;
+  lastStaleSweepAt = now;
+  await endActiveRoomLog(env, 'timeout');
+}
+
+// ----------------------------------------------------
+// 路由：/api/auth/login
+// ----------------------------------------------------
 // ----------------------------------------------------
 // 路由：/api/auth/login
 // ----------------------------------------------------
@@ -328,6 +400,12 @@ app.get('/api/room/state', requireAuth(), async (c) => {
     const profile = await loadProfile(c.env, c.get('claims'));
     const res = await getHubStub(c.env).fetch('https://room-hub/state');
     const snapshot = await res.json();
+
+    // 权威状态说没有房间，但历史里还有 active —— 那是房主被超时回收了
+    if (!snapshot.room) {
+      await sweepStaleRoomLogs(c.env);
+    }
+
     return c.json({ code: 0, ...snapshot, me: profile }, 200);
   } catch (error) {
     console.error('[Room State Error]', error);
@@ -382,6 +460,18 @@ app.post('/api/room/host/start', requireAuth(), async (c) => {
     });
 
     const data = await res.json();
+
+    // 只有 RoomHub 确认房间归我（没被 409 挡下）才记历史
+    if (res.ok) {
+      await openRoomLog(c.env, {
+        roomId: cleanRoomId,
+        publisher: profile.username,
+        inviter: inviter || profile.username,
+        hostAvatarUrl: profile.avatarUrl,
+        deepLink
+      });
+    }
+
     return c.json(data, res.status);
   } catch (error) {
     console.error('[Host Start Error]', error);
@@ -425,6 +515,11 @@ app.post('/api/room/host/stop', requireAuth(), async (c) => {
     });
 
     const data = await res.json();
+
+    if (res.ok) {
+      await endActiveRoomLog(c.env, 'manual');
+    }
+
     return c.json(data, res.status);
   } catch (error) {
     console.error('[Host Stop Error]', error);

@@ -1,7 +1,5 @@
 import jwt from 'jsonwebtoken';
-import { ObjectId } from 'mongodb';
 
-import { getDatabase } from './lib/mongodb.js';
 import { DEFAULT_JWT_SECRET } from './lib/auth.js';
 
 /**
@@ -179,7 +177,7 @@ export class RoomHub {
     }
     if (!claims?.qq) return json({ code: 401, message: '未授权' }, 401);
 
-    const profile = await this.resolveProfile(claims);
+    const profile = this.resolveProfile(claims);
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
@@ -195,31 +193,24 @@ export class RoomHub {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  async resolveProfile(claims) {
+  /**
+   * 身份只从 JWT 里取，这里刻意不查 MongoDB。
+   *
+   * Durable Object 和 Worker 跑在同一个 isolate 里，但属于**不同的 I/O 上下文**。
+   * 一旦在 DO 里复用 Worker 建立的 Mongo 连接（lib/mongodb.js 的模块级缓存），
+   * 运行时会直接抛 "Cannot perform I/O on behalf of a different Durable Object"，
+   * 或者让请求永远挂住不返回。DO 里任何对 Mongo 的调用都会踩这个坑。
+   *
+   * 何况展示用的昵称/头像本来就由 /api/user/list 在 Worker 侧直连 Mongo 提供，
+   * DO 只需要 qq 来算在线集合。
+   */
+  resolveProfile(claims) {
     const qq = String(claims.qq);
-    const fallback = {
+    return {
       qq,
       username: claims.username || `网友_${qq.slice(-4)}`,
       avatarUrl: `https://q1.qlogo.cn/g?b=qq&nk=${qq}&s=640`
     };
-
-    try {
-      const db = await getDatabase(this.env);
-      const user = await db.collection('users').findOne(
-        { qq },
-        { projection: { username: 1, avatarUrl: 1 } }
-      );
-      if (user) {
-        return {
-          qq,
-          username: user.username || fallback.username,
-          avatarUrl: user.avatarUrl || fallback.avatarUrl
-        };
-      }
-    } catch (e) {
-      console.warn('[RoomHub] 读取用户档案失败，降级使用 JWT 声明:', e.message);
-    }
-    return fallback;
   }
 
   async webSocketMessage(ws, message) {
@@ -276,16 +267,8 @@ export class RoomHub {
       if (prev.durationMs > 0) carriedPosition = Math.min(carriedPosition, prev.durationMs);
     }
 
-    // 日志必须放在归属校验「之后」：否则任何人拿别人正在放歌的 roomId 反复调 start，
-    // 就能把那条房间历史的发布者改成自己。
-    const mongoLogId = await this.openRoomLog({
-      roomId,
-      publisher: user.username,
-      inviter: inviter || user.username,
-      hostAvatarUrl: user.avatarUrl || '',
-      deepLink
-    }) ?? prev?.mongoLogId ?? null;
-
+    // 房间日志由 Worker 在校验通过之后写入 —— DO 不能碰 Mongo（见 resolveProfile 的注释），
+    // 而且放在 Worker 侧也天然保证了「先校验归属、再写历史」的顺序。
     this.room = {
       roomId,
       inviter: inviter || user.username,
@@ -303,47 +286,13 @@ export class RoomHub {
       playbackRate: prev?.playbackRate ?? 1,
       isPlaying: prev?.isPlaying ?? false,
       startedAt: prev?.startedAt ?? now,
-      lastHeartbeatAt: now,
-      mongoLogId
+      lastHeartbeatAt: now
     };
 
     await this.bumpAndBroadcast();
     await this.ensureAlarm();
 
     return json({ code: 0, message: '房间开播成功', data: publicRoom(this.room) });
-  }
-
-  /**
-   * 记录一次开播。同一个 roomId 复用同一条历史（靠 room_logs.roomId 唯一索引），
-   * 所以「同一链接反复开播」在历史里是一条记录而不是一堆。
-   * 日志是旁路，任何失败都不允许影响开播本身。
-   */
-  async openRoomLog({ roomId, publisher, inviter, hostAvatarUrl, deepLink }) {
-    const now = new Date();
-    try {
-      const db = await getDatabase(this.env);
-      const updated = await db.collection('room_logs').findOneAndUpdate(
-        { roomId },
-        {
-          $set: {
-            publisher,
-            inviter,
-            hostAvatarUrl,
-            deepLink,
-            status: 'active',
-            startedAt: now,
-            endedAt: null,
-            endReason: null
-          },
-          $setOnInsert: { createdAt: now }
-        },
-        { upsert: true, returnDocument: 'after' }
-      );
-      return (updated?.value ?? updated)?._id?.toString() ?? null;
-    } catch (e) {
-      console.warn('[RoomHub] 房间日志写入失败（不影响开播）:', e.message);
-      return null;
-    }
   }
 
   async handleHostState(request) {
@@ -414,9 +363,8 @@ export class RoomHub {
   }
 
   async closeRoom(reason) {
-    const closing = this.room;
     // 没有房间可关就什么都不做：重复 stop 不该再广播一次 room_closed
-    if (!closing) return;
+    if (!this.room) return;
 
     this.room = null;
     this.version += 1;
@@ -437,26 +385,6 @@ export class RoomHub {
       }
     }
 
-    if (closing?.mongoLogId) {
-      await this.archiveLog(closing.mongoLogId, reason);
-    }
-  }
-
-  async archiveLog(mongoLogId, reason) {
-    try {
-      const db = await getDatabase(this.env);
-      await db.collection('room_logs').updateOne(
-        { _id: new ObjectId(mongoLogId) },
-        {
-          $set: {
-            status: 'ended',
-            endedAt: new Date(),
-            endReason: reason === 'timeout' ? 'timeout' : 'manual'
-          }
-        }
-      );
-    } catch (e) {
-      console.warn('[RoomHub] 归档房间日志失败:', e.message);
-    }
+    // 房间历史由 Worker 侧收尾（按 roomId 归档），DO 不碰 Mongo
   }
 }

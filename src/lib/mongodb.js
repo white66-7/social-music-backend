@@ -1,5 +1,15 @@
 import { MongoClient } from 'mongodb';
 
+/**
+ * ⚠️ 只能在 Worker 的请求处理里调用，绝对不要在 Durable Object 里调用。
+ *
+ * 这个 client 缓存在模块作用域上，而 Durable Object 和 Worker 跑在同一个 isolate、
+ * 却属于不同的 I/O 上下文。DO 一旦复用它，运行时会抛
+ * "Cannot perform I/O on behalf of a different Durable Object"，
+ * 或者让请求永远不返回（表现为 500 "code had hung"）。
+ *
+ * DO 需要的一切都必须走 ctx.storage，或者由 Worker 通过参数传进去。
+ */
 let cachedClient = null;
 let isIndexesInitialized = false;
 
