@@ -200,16 +200,39 @@ check('room-hub.js 不 import redis', !/lib\/redis/.test(hubSource));
 // 真正致命的是「复用模块级缓存的连接对象」，那条约束在 [11] 里单独检查。
 check('room-hub.js 不缓存连接对象', !/^let\s+\w*[Cc]lient\s*=/m.test(hubSource));
 
-console.log('\n[11] 静态约束：Mongo 连接不得缓存在模块作用域');
-// Cloudflare 按「请求」划分 I/O 上下文。模块级缓存的 MongoClient 在后续请求里复用，
-// 会让请求永不返回（500 "code had hung"）；同一请求里再调 DO 则直接抛
-// "Cannot perform I/O on behalf of a different Durable Object"。
+console.log('\n[11] 静态约束：数据层必须走 D1，不得再引入要持有连接的客户端');
+// Cloudflare 按「请求」划分 I/O 上下文。像 MongoClient 这种要在模块层持有连接的
+// 客户端，跨请求复用会让请求永不返回（500 "code had hung"），
+// 与 DO 混用时还会抛 "Cannot perform I/O on behalf of a different Durable Object"。
 // 实测表现为「一次成功、一次挂死」交替 —— 旧版成员列表在 1 人和 2 人之间横跳的根因。
-const mongoSource = readFileSync(new URL('../src/lib/mongodb.js', import.meta.url), 'utf8');
-check('模块级没有 client 变量', !/^let\s+\w*[Cc]lient\s*=/m.test(mongoSource));
-check('模块级没有 cachedRedis 式的连接缓存', !/^let\s+cached/m.test(mongoSource));
-check('导出 closeDatabase 供请求收尾', /export async function closeDatabase/.test(mongoSource));
-check('getDatabase 接收 Hono 上下文而非 env', /export async function getDatabase\(c\)/.test(mongoSource));
+// 迁到 D1 后这类问题从根上消失，这几条断言防止有人再引回来。
+const dbSource = readFileSync(new URL('../src/lib/db.js', import.meta.url), 'utf8');
+check('db.js 通过 D1 binding 访问', /env\.DB/.test(dbSource));
+check('db.js 不 import 任何数据库驱动', !/from ['"](mongodb|pg|mysql)/.test(dbSource));
+check('db.js 模块级没有连接变量', !/^let\s+\w*[Cc]lient\s*=/m.test(dbSource));
+
+const indexSrc = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
+check('index.js 不再引用 mongodb', !/mongodb/i.test(indexSrc));
+check('index.js 没有连接缓存', !/^let\s+cached/m.test(indexSrc));
+
+console.log('\n[13] 静态约束：房间实时路径不得调用 Mongo');
+// 每次请求新建 Mongo 连接要 2~4 秒（Cloudflare 按请求划分 I/O 上下文，
+// 连接不能跨请求复用）。开房/关房/查房间状态都是实时操作，
+// 一旦这些路由里混进 getDatabase/loadProfile，用户就会明显感觉到卡。
+const indexSource = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
+
+function routeBody(path) {
+  const start = indexSource.indexOf(`'${path}'`);
+  if (start < 0) return '';
+  const end = indexSource.indexOf('\n});', start);
+  return indexSource.slice(start, end < 0 ? undefined : end);
+}
+
+for (const path of ['/api/room/state', '/api/room/host/start', '/api/room/host/stop']) {
+  const body = routeBody(path);
+  check(`${path} 已抽出处理体`, body.length > 0);
+  check(`${path} 不调用 getDatabase/loadProfile`, !/getDatabase|loadProfile/.test(body));
+}
 
 console.log(`\n${failures === 0 ? '全部通过' : failures + ' 项失败'}`);
 process.exit(failures === 0 ? 0 : 1);

@@ -210,15 +210,15 @@ export class RoomHub {
   }
 
   /**
-   * 身份只从 JWT 里取，这里刻意不查 MongoDB。
+   * 身份只从 JWT 里取，这里刻意不查数据库。
    *
-   * Durable Object 和 Worker 跑在同一个 isolate 里，但属于**不同的 I/O 上下文**。
-   * 一旦在 DO 里复用 Worker 建立的 Mongo 连接（lib/mongodb.js 的模块级缓存），
-   * 运行时会直接抛 "Cannot perform I/O on behalf of a different Durable Object"，
-   * 或者让请求永远挂住不返回。DO 里任何对 Mongo 的调用都会踩这个坑。
-   *
-   * 何况展示用的昵称/头像本来就由 /api/user/list 在 Worker 侧直连 Mongo 提供，
-   * DO 只需要 qq 来算在线集合。
+   * Durable Object 和 Worker 跑在同一个 isolate 里、却属于**不同的 I/O 上下文**。
+   * 在 DO 里碰任何「需要在模块层持有连接」的东西都会踩坑 —— 当初数据还在
+   * MongoDB 上时，就因为复用了 Worker 建立的连接而抛
+   * "Cannot perform I/O on behalf of a different Durable Object"，或者让请求永远挂住。
+   * 现在数据在 D1 上、走 binding 没有连接概念，但 DO 依然不需要查库：
+   * 展示用的昵称/头像由 /api/user/list 在 Worker 侧提供，
+   * DO 只要 qq 来算在线集合就够了。
    */
   resolveProfile(claims) {
     const qq = String(claims.qq);

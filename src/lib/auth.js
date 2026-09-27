@@ -1,5 +1,5 @@
 import jwt from 'jsonwebtoken';
-import { getDatabase } from './mongodb.js';
+import { findUser } from './db.js';
 
 // 保留原有的兜底密钥，这样已经发出去的 30 天 token 不会因为本次重构而全部失效
 export const DEFAULT_JWT_SECRET = 'white667-social-music-secure-jwt-key';
@@ -39,7 +39,7 @@ export function readClaims(env, request, url) {
  * JWT 里的 username 是签发那一刻的快照，用户改过昵称后就是脏数据，
  * 所以展示用的昵称/头像一律以数据库为准，读不到才降级用 JWT 声明。
  */
-export async function loadProfile(c, claims) {
+export async function loadProfile(env, claims) {
   const qq = String(claims.qq);
   const fallback = {
     qq,
@@ -48,16 +48,12 @@ export async function loadProfile(c, claims) {
   };
 
   try {
-    const db = await getDatabase(c);
-    const user = await db.collection('users').findOne(
-      { qq },
-      { projection: { username: 1, avatarUrl: 1 } }
-    );
+    const user = await findUser(env, qq);
     if (user) {
       return {
         qq,
         username: user.username || fallback.username,
-        avatarUrl: user.avatarUrl || fallback.avatarUrl
+        avatarUrl: user.avatar_url || fallback.avatarUrl
       };
     }
   } catch (e) {

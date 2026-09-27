@@ -2,7 +2,20 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import bcrypt from 'bcryptjs';
 
-import { getDatabase, closeDatabase } from './lib/mongodb.js';
+import {
+  findUser,
+  listUsers,
+  insertUser,
+  touchUserLogin,
+  syncUserProfile,
+  setUsername,
+  upsertRoomLog,
+  endActiveRoomLogs,
+  listRoomLogs,
+  toPublicUser,
+  qqAvatarUrl,
+  defaultNickname
+} from './lib/db.js';
 import {
   getRedis,
   getLoginFailCount,
@@ -43,74 +56,28 @@ app.use('*', async (c, next) => {
   return corsMiddleware(c, next);
 });
 
-// Mongo 连接是按请求创建的（见 lib/mongodb.js 的说明：跨请求复用会让请求永久挂死），
-// 所以每个请求结束都必须把它关掉，否则会持续泄漏到 Atlas 的连接。
-app.use('*', async (c, next) => {
-  try {
-    await next();
-  } finally {
-    await closeDatabase(c);
-  }
-});
-
 app.get('/api/health', (c) => c.json({ code: 0, message: 'ok', time: Date.now() }, 200));
 
 // ----------------------------------------------------
-// 房间历史
+// 辅助
 //
-// 这些操作必须留在 Worker 侧：Durable Object 与本 Worker 跑在同一个 isolate
-// 但属于不同的 I/O 上下文，DO 里复用 Worker 建立的 Mongo 连接会直接抛
-// "Cannot perform I/O on behalf of a different Durable Object"，或者让请求永久挂住。
-//
-// 顺序上同样要小心：日志一律在 RoomHub 校验通过之后才写，
+// 注意：房间历史一律在 RoomHub 校验通过之后才写，
 // 否则任何人拿别人正在放歌的 roomId 反复调 start 就能改写那条历史。
 // ----------------------------------------------------
-async function openRoomLog(c, { roomId, publisher, inviter, hostAvatarUrl, deepLink }) {
-  const now = new Date();
-  try {
-    const db = await getDatabase(c);
-    await db.collection('room_logs').findOneAndUpdate(
-      { roomId },
-      {
-        $set: {
-          publisher,
-          inviter,
-          hostAvatarUrl,
-          deepLink,
-          status: 'active',
-          startedAt: now,
-          endedAt: null,
-          endReason: null
-        },
-        $setOnInsert: { createdAt: now }
-      },
-      { upsert: true }
-    );
-  } catch (e) {
-    console.warn('[Room Log] 写入失败（不影响开播）:', e.message);
-  }
-}
 
 /**
- * 收尾当前活动房间的历史记录。
- * 全站同时只允许一个房间，所以不需要 roomId 也能精确定位。
+ * 从 JWT 声明推导展示用的用户信息，不查库。
+ *
+ * 头像直接由 QQ 号推导：本应用的头像始终来自 QQ，用户无法在应用内改，
+ * 所以这跟查一次库一样准，却省掉一次查询。
  */
-async function endActiveRoomLog(c, reason) {
-  try {
-    const db = await getDatabase(c);
-    await db.collection('room_logs').updateMany(
-      { status: 'active' },
-      {
-        $set: {
-          status: 'ended',
-          endedAt: new Date(),
-          endReason: reason === 'timeout' ? 'timeout' : 'manual'
-        }
-      }
-    );
-  } catch (e) {
-    console.warn('[Room Log] 归档失败:', e.message);
-  }
+function profileFromClaims(claims) {
+  const qq = String(claims.qq);
+  return {
+    qq,
+    username: claims.username || defaultNickname(qq),
+    avatarUrl: qqAvatarUrl(qq)
+  };
 }
 
 /**
@@ -120,16 +87,27 @@ async function endActiveRoomLog(c, reason) {
 let lastStaleSweepAt = 0;
 const STALE_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
-async function sweepStaleRoomLogs(c) {
+async function sweepStaleRoomLogs(env) {
   const now = Date.now();
   if (now - lastStaleSweepAt < STALE_SWEEP_INTERVAL_MS) return;
   lastStaleSweepAt = now;
-  await endActiveRoomLog(c, 'timeout');
+
+  try {
+    await endActiveRoomLogs(env, 'timeout');
+  } catch (e) {
+    console.warn('[Room Log] 清理陈旧记录失败:', e.message);
+  }
 }
 
-// ----------------------------------------------------
-// 路由：/api/auth/login
-// ----------------------------------------------------
+/** 房间历史是旁路数据，写失败绝不能影响放歌本身 */
+async function safeRoomLog(label, work) {
+  try {
+    await work();
+  } catch (e) {
+    console.warn(`[Room Log] ${label}失败（不影响主流程）:`, e.message);
+  }
+}
+
 // ----------------------------------------------------
 // 路由：/api/auth/login
 // ----------------------------------------------------
@@ -154,9 +132,7 @@ app.post('/api/auth/login', async (c) => {
       return c.json({ code: 429, message: '口令错误次数过多，请 10 分钟后再试' }, 429);
     }
 
-    const db = await getDatabase(c);
-    const usersCollection = db.collection('users');
-    const existingUser = await usersCollection.findOne({ qq: cleanQq });
+    const existingUser = await findUser(env, cleanQq);
 
     if (existingUser) {
       const storedPin = typeof existingUser.pin === 'string' ? existingUser.pin : '';
@@ -181,44 +157,41 @@ app.post('/api/auth/login', async (c) => {
 
       await clearLoginFailures(redis, cleanQq);
 
-      const updateData = { lastActiveAt: Date.now() };
-      if (!storedPin.startsWith('$2')) {
-        updateData.pin = await bcrypt.hash(cleanPin, 10);
-      }
-      await usersCollection.updateOne({ qq: cleanQq }, { $set: updateData });
+      const now = Date.now();
+      // 明文口令在这一刻就地升级成 bcrypt；已是哈希的就不重复计算
+      const newPinHash = storedPin.startsWith('$2') ? null : await bcrypt.hash(cleanPin, 10);
+      await touchUserLogin(env, cleanQq, { pin: newPinHash, lastActiveAt: now });
 
       const token = signToken(env, existingUser);
-      const { pin: _pin, _id, ...safeUser } = existingUser;
 
       return c.json({
         code: 0,
         message: '登录成功',
         token,
-        user: safeUser
+        user: { ...toPublicUser(existingUser), lastActiveAt: now }
       }, 200);
     }
 
-    const defaultNickname = `网友_${cleanQq.slice(-4)}`;
-    const newUser = {
-      qq: cleanQq,
-      username: defaultNickname,
-      avatarUrl: `https://q1.qlogo.cn/g?b=qq&nk=${cleanQq}&s=640`,
-      pin: await bcrypt.hash(cleanPin, 10),
-      createdAt: Date.now(),
-      lastActiveAt: Date.now()
-    };
+    const now = Date.now();
+    const nickname = defaultNickname(cleanQq);
+    const avatarUrl = qqAvatarUrl(cleanQq);
 
-    await usersCollection.insertOne(newUser);
+    await insertUser(env, {
+      qq: cleanQq,
+      username: nickname,
+      avatarUrl,
+      pin: await bcrypt.hash(cleanPin, 10),
+      createdAt: now
+    });
     await clearLoginFailures(redis, cleanQq);
 
-    const token = signToken(env, newUser);
-    const { pin: _pin, _id, ...safeUser } = newUser;
+    const token = signToken(env, { qq: cleanQq, username: nickname });
 
     return c.json({
       code: 0,
       message: '首次认证并绑定成功',
       token,
-      user: safeUser
+      user: { qq: cleanQq, username: nickname, avatarUrl, createdAt: now, lastActiveAt: now }
     }, 200);
 
   } catch (error) {
@@ -231,7 +204,7 @@ app.post('/api/auth/login', async (c) => {
 // 路由：/api/user/me
 // ----------------------------------------------------
 app.get('/api/user/me', requireAuth(), async (c) => {
-  const profile = await loadProfile(c, c.get('claims'));
+  const profile = await loadProfile(c.env, c.get('claims'));
   return c.json({ code: 0, data: profile }, 200);
 });
 
@@ -243,42 +216,26 @@ app.get('/api/user/me', requireAuth(), async (c) => {
 // ----------------------------------------------------
 app.get('/api/user/list', requireAuth(), async (c) => {
   try {
-    const db = await getDatabase(c);
-
-    const usersPromise = db.collection('users')
-      .aggregate([
-        { $match: { qq: { $type: 'string', $ne: '' } } },
-        {
-          $addFields: {
-            lastActiveAt: {
-              $convert: { input: '$lastActiveAt', to: 'long', onError: 0, onNull: 0 }
-            }
-          }
-        },
-        { $project: { pin: 0 } },
-        { $sort: { lastActiveAt: -1 } }
-      ])
-      .toArray();
-
-    const presencePromise = getHubStub(c.env)
-      .fetch('https://room-hub/members')
-      .then(r => r.json())
-      .catch(() => null);
-
-    const [users, presence] = await Promise.all([usersPromise, presencePromise]);
+    const [users, presence] = await Promise.all([
+      listUsers(c.env),
+      getHubStub(c.env)
+        .fetch('https://room-hub/members')
+        .then(r => r.json())
+        .catch(() => null)
+    ]);
 
     const online = new Set((presence?.members || []).map(m => m.qq));
     const hostQq = (presence?.members || []).find(m => m.isHosting)?.qq || null;
 
-    const data = (users || []).map(u => {
+    const data = users.map(u => {
       const qq = String(u.qq);
       return {
         qq,
-        username: u.username || `网友_${qq.slice(-4)}`,
-        avatarUrl: u.avatarUrl || `https://q1.qlogo.cn/g?b=qq&nk=${qq}&s=640`,
+        username: u.username || defaultNickname(qq),
+        avatarUrl: u.avatar_url || qqAvatarUrl(qq),
         isOnline: online.has(qq),
         isHosting: Boolean(hostQq && hostQq === qq),
-        lastActiveAt: u.lastActiveAt || 0
+        lastActiveAt: u.last_active_at || 0
       };
     });
 
@@ -294,37 +251,19 @@ app.get('/api/user/list', requireAuth(), async (c) => {
 // ----------------------------------------------------
 app.post('/api/user/sync', requireAuth(), async (c) => {
   try {
-    const profile = await loadProfile(c, c.get('claims'));
+    const claims = c.get('claims');
     const { username, avatarUrl } = await c.req.json().catch(() => ({}));
 
-    const db = await getDatabase(c);
-    const now = Date.now();
-
-    const updateDoc = {
-      $set: { lastActiveAt: now, updatedAt: now },
-      $setOnInsert: { createdAt: now, qq: profile.qq }
-    };
-    if (typeof username === 'string' && username.trim()) {
-      updateDoc.$set.username = username.trim();
-    }
-    if (typeof avatarUrl === 'string' && avatarUrl.trim()) {
-      updateDoc.$set.avatarUrl = avatarUrl.trim();
-    }
-
     // qq 一律取自 token，请求体里传什么都不作数。
-    // 这里刻意不 upsert：以前会凭空造出一个没有 pin 的用户档案，
-    // 而登录逻辑把「没有 pin」当成首次绑定，等于谁都能凭 QQ 号认领这个账号。
-    const result = await db.collection('users').findOneAndUpdate(
-      { qq: profile.qq },
-      updateDoc,
-      { returnDocument: 'after' }
-    );
+    // 刻意不做 upsert：以前会凭空造出一个没有 pin 的档案，
+    // 而登录又曾把「没有 pin」当首次绑定放行，等于谁都能凭 QQ 号认领账号。
+    const hit = await syncUserProfile(c.env, String(claims.qq), { username, avatarUrl });
 
-    if (!result) {
+    if (!hit) {
       return c.json({ code: 404, message: '用户档案不存在，请先使用 QQ 号登录' }, 404);
     }
 
-    return c.json({ code: 0, message: '用户档案同步成功', data: result?.value ?? result }, 200);
+    return c.json({ code: 0, message: '用户档案同步成功' }, 200);
   } catch (error) {
     console.error('[User Sync Error]', error);
     return c.json({ code: 500, message: '服务器内部错误' }, 500);
@@ -336,7 +275,7 @@ app.post('/api/user/sync', requireAuth(), async (c) => {
 // ----------------------------------------------------
 app.post('/api/user/update-name', requireAuth(), async (c) => {
   try {
-    const profile = await loadProfile(c, c.get('claims'));
+    const qq = String(c.get('claims').qq);
     const { newUsername } = await c.req.json().catch(() => ({}));
     const cleanName = String(newUsername || '').trim();
 
@@ -347,20 +286,13 @@ app.post('/api/user/update-name', requireAuth(), async (c) => {
       return c.json({ code: 400, message: '昵称最多 12 个字' }, 400);
     }
 
-    const db = await getDatabase(c);
-    const now = Date.now();
-
-    await db.collection('users').updateOne(
-      { qq: profile.qq },
-      { $set: { username: cleanName, lastActiveAt: now, updatedAt: now } },
-      { upsert: true }
-    );
+    await setUsername(c.env, qq, cleanName);
 
     return c.json({
       code: 0,
       message: '昵称更新成功',
       username: cleanName,
-      data: { qq: profile.qq, username: cleanName, avatarUrl: profile.avatarUrl }
+      data: { qq, username: cleanName, avatarUrl: qqAvatarUrl(qq) }
     }, 200);
   } catch (err) {
     console.error('[Update Name Error]', err);
@@ -374,24 +306,19 @@ app.post('/api/user/update-name', requireAuth(), async (c) => {
 app.get('/api/room/history', requireAuth(), async (c) => {
   try {
     const limit = Math.min(parseInt(c.req.query('limit')) || 10, 30);
-    const db = await getDatabase(c);
+    const rows = await listRoomLogs(c.env, limit);
 
-    const history = await db.collection('room_logs')
-      .find({})
-      .sort({ startedAt: -1 })
-      .limit(limit)
-      .project({
-        roomId: 1,
-        publisher: 1,
-        inviter: 1,
-        hostAvatarUrl: 1,
-        startedAt: 1,
-        endedAt: 1,
-        status: 1
-      })
-      .toArray();
+    const data = rows.map(r => ({
+      roomId: r.room_id,
+      publisher: r.publisher,
+      inviter: r.inviter,
+      hostAvatarUrl: r.host_avatar_url,
+      startedAt: r.started_at,
+      endedAt: r.ended_at,
+      status: r.status
+    }));
 
-    return c.json({ code: 0, data: history }, 200);
+    return c.json({ code: 0, data }, 200);
   } catch (error) {
     console.error('[Get History Error]', error);
     return c.json({ code: 500, message: '查询历史失败' }, 500);
@@ -407,16 +334,17 @@ app.get('/api/room/history', requireAuth(), async (c) => {
 // ----------------------------------------------------
 app.get('/api/room/state', requireAuth(), async (c) => {
   try {
-    const profile = await loadProfile(c, c.get('claims'));
+    // 只取 DO 里那份权威状态。这个接口客户端每次启动/回前台都会调，
+    // 不该顺带做任何多余的事。用户档案由客户端另行调 /api/user/me。
     const res = await getHubStub(c.env).fetch('https://room-hub/state');
     const snapshot = await res.json();
 
     // 权威状态说没有房间，但历史里还有 active —— 那是房主被超时回收了
     if (!snapshot.room) {
-      await sweepStaleRoomLogs(c);
+      await sweepStaleRoomLogs(c.env);
     }
 
-    return c.json({ code: 0, ...snapshot, me: profile }, 200);
+    return c.json({ code: 0, ...snapshot }, 200);
   } catch (error) {
     console.error('[Room State Error]', error);
     return c.json({ code: 500, message: '获取房间状态失败' }, 500);
@@ -445,7 +373,7 @@ app.get('/api/room/ws', async (c) => {
 // ----------------------------------------------------
 app.post('/api/room/host/start', requireAuth(), async (c) => {
   try {
-    const profile = await loadProfile(c, c.get('claims'));
+    const claims = c.get('claims');
     const { roomId, inviter, secret, deepLink, serverUrl } = await c.req.json().catch(() => ({}));
 
     const cleanRoomId = String(roomId || '').trim();
@@ -456,11 +384,14 @@ app.post('/api/room/host/start', requireAuth(), async (c) => {
       return c.json({ code: 400, message: '未解析到房间密钥' }, 400);
     }
 
+    // 身份全在 JWT 里，这里不需要查库 —— 开房是实时操作，不该等任何数据库往返。
+    const user = profileFromClaims(claims);
+
     const res = await getHubStub(c.env).fetch('https://room-hub/host/start', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        user: profile,
+        user,
         roomId: cleanRoomId,
         inviter,
         secret,
@@ -471,15 +402,16 @@ app.post('/api/room/host/start', requireAuth(), async (c) => {
 
     const data = await res.json();
 
-    // 只有 RoomHub 确认房间归我（没被 409 挡下）才记历史
+    // 只有 RoomHub 确认房间归我（没被 409 挡下）才记历史。
+    // 历史是旁路数据，写失败也不影响开播。
     if (res.ok) {
-      await openRoomLog(c, {
+      await safeRoomLog('写入', () => upsertRoomLog(c.env, {
         roomId: cleanRoomId,
-        publisher: profile.username,
-        inviter: inviter || profile.username,
-        hostAvatarUrl: profile.avatarUrl,
+        publisher: user.username,
+        inviter: inviter || user.username,
+        hostAvatarUrl: user.avatarUrl,
         deepLink
-      });
+      }));
     }
 
     return c.json(data, res.status);
@@ -527,7 +459,7 @@ app.post('/api/room/host/stop', requireAuth(), async (c) => {
     const data = await res.json();
 
     if (res.ok) {
-      await endActiveRoomLog(c, 'manual');
+      await safeRoomLog('归档', () => endActiveRoomLogs(c.env, 'manual'));
     }
 
     return c.json(data, res.status);

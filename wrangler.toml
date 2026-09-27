@@ -20,3 +20,15 @@ class_name = "RoomHub"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["RoomHub"]
+
+# ============================================================
+# 用户 / 房间历史
+#
+# 2026-09 从 MongoDB 迁到 D1。原因是 Cloudflare 按「请求」划分 I/O 上下文，
+# MongoClient 不能跨请求复用，于是每个请求都要重建连接 —— 实测一次 2~4 秒，
+# 登录、成员列表、开房全都被拖慢。D1 走 binding、没有连接概念，单次查询 1~5ms。
+# ============================================================
+[[d1_databases]]
+binding = "DB"
+database_name = "social-music-db"
+database_id = "8a3817fe-5fb2-40fc-b37e-274a49ebf647"
