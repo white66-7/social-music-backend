@@ -452,12 +452,14 @@ app.post('/api/room/host/start', requireAuth(), async (c) => {
 app.post('/api/room/host/state', requireAuth(), async (c) => {
   try {
     const claims = c.get('claims');
-    const { playback } = await c.req.json().catch(() => ({}));
+    // neriToken 是房主在播放器那边的成员 Bearer Token，
+    // DO 的存活探测要用它（那个接口不带 token 一律 401）
+    const { playback, neriToken } = await c.req.json().catch(() => ({}));
 
     const res = await getHubStub(c.env).fetch('https://room-hub/host/state', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ user: { qq: String(claims.qq) }, playback })
+      body: JSON.stringify({ user: { qq: String(claims.qq) }, playback, neriToken })
     });
 
     const data = await res.json();

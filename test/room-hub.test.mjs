@@ -156,6 +156,9 @@ await hub.fetch(post('/host/start', {
 snap = await (await hub.fetch(new Request('https://room-hub/state'))).json();
 check('房间已建立', snap.room?.roomId === 'gone01');
 
+// 存活探测需要成员 token（协议要求），房主会上报一份
+await hub.fetch(post('/host/state', { user: A, neriToken: 'tok-gone01' }));
+
 const realFetch = globalThis.fetch;
 // 打桩：播放器服务器说这个房间不存在
 globalThis.fetch = async () => new Response('{"ok":false,"error":"room not initialized"}', { status: 404 });
@@ -175,6 +178,8 @@ await hub.fetch(post('/host/start', {
   user: A, roomId: 'alive01', inviter: '阿甲', secret: 's3cret',
   deepLink: 'neriplayer://x?roomId=alive01', serverUrl: 'https://neri.test'
 }));
+// 同样要给 token，否则探测会跳过、这条测的就不是「网络失败」了
+await hub.fetch(post('/host/state', { user: A, neriToken: 'tok-alive01' }));
 globalThis.fetch = async () => { throw new Error('network down'); };
 hub.lastExistenceCheckAt = 0;
 await hub.alarm();
@@ -317,6 +322,46 @@ check('被识别为迟到', lateBody.stale === true);
 check('但房间依然被点亮了', snap.room?.roomId === 'pend03', JSON.stringify(snap.room));
 check('播放状态没有被迟到的那条污染', snap.room?.currentSong === '第二首', `got ${snap.room?.currentSong}`);
 await hub.fetch(post('/host/stop', { user: A }));
+
+console.log('\n[20] 存活探测必须带上成员 token（否则永远 401、永远判不出房间已消失）');
+await hub.fetch(post('/host/start', {
+  user: A, roomId: 'probe01', inviter: '阿甲', secret: 's3cret',
+  deepLink: 'neriplayer://x?roomId=probe01', serverUrl: 'https://neri.test'
+}));
+
+// 没上报 token 时不该去探测 —— 探了必然 401，那证明不了任何事
+let probeCalls = 0;
+let lastAuthHeader = null;
+globalThis.fetch = async (url, init) => {
+  probeCalls++;
+  lastAuthHeader = init?.headers?.Authorization ?? null;
+  return new Response('{"ok":false,"error":"unauthorized"}', { status: 401 });
+};
+hub.lastExistenceCheckAt = 0;
+await hub.alarm();
+check('没有 token 时不去探测', probeCalls === 0, `probed ${probeCalls} 次`);
+
+// 房主上报 token 之后才开始探测，并且要带上 Authorization
+await hub.fetch(post('/host/state', { user: A, neriToken: 'tok-abc' }));
+hub.lastExistenceCheckAt = 0;
+await hub.alarm();
+check('拿到 token 后开始探测', probeCalls === 1, `probed ${probeCalls} 次`);
+check('探测带上了正确的 Bearer 头', lastAuthHeader === 'Bearer tok-abc', String(lastAuthHeader));
+
+// 401 说明 token 失效，而不是房间没了 —— 不能据此关房
+snap = await (await hub.fetch(new Request('https://room-hub/state'))).json();
+check('401 不得误判成房间已消失', snap.room?.roomId === 'probe01', JSON.stringify(snap.room));
+check('鉴权失败后清掉失效 token', !hub.room.neriToken);
+globalThis.fetch = realFetch;
+
+// 带上有效 token、服务端说 404 → 才应该关房
+await hub.fetch(post('/host/state', { user: A, neriToken: 'tok-fresh' }));
+globalThis.fetch = async () => new Response('{"ok":false,"error":"room not initialized"}', { status: 404 });
+hub.lastExistenceCheckAt = 0;
+await hub.alarm();
+globalThis.fetch = realFetch;
+snap = await (await hub.fetch(new Request('https://room-hub/state'))).json();
+check('有 token 且 404 时正常关房', snap.room === null);
 
 console.log('\n[19] 关房必须锁定到具体房间号');
 // 关房按「用户」关，一条迟到的 stop（关播后立刻重开、已作废的开房请求延迟撤销）

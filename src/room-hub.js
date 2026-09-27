@@ -367,6 +367,12 @@ export class RoomHub {
     const now = Date.now();
     this.room.lastHeartbeatAt = now;
 
+    // 房主把播放器的**成员 Bearer Token** 一并上报上来，存活探测要用它。
+    // 见 verifyRoomStillExists：那个接口不带 token 一律 401。
+    if (typeof body.neriToken === 'string' && body.neriToken) {
+      this.room.neriToken = body.neriToken;
+    }
+
     // 「确认房间可见」和「播放状态」是两件独立的事：前者只关系到房间对成员是否可见，
     // 不该被播放状态的序号闸门挡住 —— 否则一条迟到的上报顺手把 confirm 也吞掉，
     // 房间就永远亮不出来了。所以它放在序号检查之前。
@@ -490,6 +496,15 @@ export class RoomHub {
     const room = this.room;
     if (!room?.roomId) return;
 
+    // `GET /api/rooms/:id/state` 需要**房间成员的 Bearer Token**
+    // （NeriPlayer-LTW 的协议要求：`authenticateMember` 拿不到就返回 401）。
+    //
+    // 以前这里完全没带 token，于是每次都收 401 —— 而 401 既不是 404 也不是 410，
+    // 所以永远得不出「房间没了」的结论。这条兜底等于从来没生效过，
+    // 僵尸房间全靠 90 秒心跳 TTL 回收。
+    const token = room.neriToken;
+    if (!token) return;
+
     const now = Date.now();
     if (now - this.lastExistenceCheckAt < EXISTENCE_CHECK_INTERVAL_MS) return;
     this.lastExistenceCheckAt = now;
@@ -502,12 +517,21 @@ export class RoomHub {
     try {
       const res = await fetch(url, {
         method: 'GET',
+        headers: { Authorization: `Bearer ${token}` },
         signal: AbortSignal.timeout(EXISTENCE_CHECK_TIMEOUT_MS)
       });
 
       if (res.status === 404 || res.status === 410) {
         console.warn(`[RoomHub] 播放器服务器报告房间 ${room.roomId} 已不存在，自动关房`);
         await this.closeRoom('room_gone');
+        return;
+      }
+
+      if (res.status === 401 || res.status === 403) {
+        // 鉴权失败说明 token 过期或失效了，这**证明不了**房间在不在，别下结论。
+        // 清除它，等房主下一次上报带上新的。
+        console.warn('[RoomHub] 存活探测鉴权失败，已清除旧 token（房间状态暂不判定）');
+        this.room.neriToken = null;
       }
       // 其它状态码（含 5xx）一律不下结论，等下一轮
     } catch (e) {
