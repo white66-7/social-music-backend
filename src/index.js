@@ -44,7 +44,7 @@ async function archiveRoomLog(env, room, endReason) {
 }
 
 // ----------------------------------------------------
-// 路由：/api/broadcast (⚡ 极速稳定版，无审核助手，杜绝 500)
+// 路由：/api/broadcast (⚡ 防 500 自愈版：彻底解决二次开房报错)
 // ----------------------------------------------------
 app.post('/api/broadcast', async (c) => {
   const env = c.env;
@@ -58,11 +58,20 @@ app.post('/api/broadcast', async (c) => {
       return c.json({ code: 400, message: '缺少 action 参数' }, 400);
     }
 
-    const currentRoom = await loadRoom(redis);
+    // ⚡ 1. 安全读取 Redis，防止读取或解析异常
+    let currentRoom = null;
+    try {
+      currentRoom = await loadRoom(redis);
+    } catch (_) {
+      currentRoom = null;
+    }
 
+    // ==========================================
+    // 分支 1：开启房间 (action === 'start')
+    // ==========================================
     if (action === 'start') {
       const roomOwner = currentRoom ? (currentRoom.publisher || currentRoom.inviter) : null;
-      // 如果当前已有其他人在放歌，且不是当前申请人
+      // 如果当前已有其他人在放歌且不是房主本人
       if (currentRoom && roomOwner && roomOwner !== username) {
         return c.json({
           code: 409,
@@ -78,7 +87,7 @@ app.post('/api/broadcast', async (c) => {
       let mongoLogId = null;
       const now = new Date();
 
-      // ⚡ 将 MongoDB 彻底隔离包裹：即使 Mongo 断连、超时，绝不阻断开播！
+      // ⚡ 2. MongoDB 彻底隔离：即便数据库挂了、唯一索引冲突，也绝对不影响开播
       try {
         const db = await getDatabase(env);
 
@@ -87,19 +96,12 @@ app.post('/api/broadcast', async (c) => {
           const host = await db.collection('users').findOne(
             { $or: [{ qq: key }, { username: key }] },
             { projection: { avatarUrl: 1 } }
-          );
+          ).catch(() => null);
           if (host?.avatarUrl) hostAvatarUrl = host.avatarUrl;
         }
 
-        if (resume) {
-          const existing = await db.collection('room_logs').findOne(
-            { roomId, publisher: username, status: 'active' },
-            { sort: { startedAt: -1 }, projection: { _id: 1 } }
-          );
-          if (existing) mongoLogId = existing._id.toString();
-        }
-
-        if (!mongoLogId) {
+        // ⚡ 关键自愈：插入日志时，即使二次开播遇到相同的 roomId 唯一索引，自动捕获降级，绝不抛出 500！
+        try {
           const insertResult = await db.collection('room_logs').insertOne({
             roomId,
             publisher: username,
@@ -112,12 +114,31 @@ app.post('/api/broadcast', async (c) => {
             endReason: null,
           });
           mongoLogId = insertResult.insertedId.toString();
+        } catch (insertErr) {
+          console.warn('[MongoDB] insertOne 存在旧记录或索引冲突，尝试更新既有日志:', insertErr.message);
+          // 如果有重复的 roomId，直接更新旧日志状态为 active
+          const updateResult = await db.collection('room_logs').findOneAndUpdate(
+            { roomId },
+            { 
+              $set: { 
+                status: 'active', 
+                publisher: username, 
+                inviter: inviter || username,
+                hostAvatarUrl,
+                startedAt: now, 
+                endedAt: null, 
+                endReason: null 
+              } 
+            },
+            { returnDocument: 'after' }
+          ).catch(() => null);
+          mongoLogId = updateResult?.value?._id?.toString() || updateResult?._id?.toString() || null;
         }
       } catch (dbErr) {
-        console.warn('[MongoDB 警告] 用户查询或写入日志失败（已跳过，保证开播）:', dbErr.message);
+        console.warn('[MongoDB 警告] 数据库操作完全跳过（已保证主流程顺畅）:', dbErr.message);
       }
 
-      // ⚡ 构建广播载荷：直接采用前端提交的信息，秒级上线
+      // ⚡ 3. 核心开播载荷（直接基于 Redis 保证毫秒级就绪）
       const newRoomPayload = {
         roomId,
         inviter: inviter || username,
@@ -126,21 +147,19 @@ app.post('/api/broadcast', async (c) => {
         secret: secret || '',
         deepLink,
         serverUrl: serverUrl || '',
-        currentSong: body.currentSong || currentRoom?.currentSong || null,
-        currentCover: body.currentCover || currentRoom?.currentCover || null,
-        durationMs: body.durationMs || currentRoom?.durationMs || 0,
-        basePositionMs: body.basePositionMs || currentRoom?.basePositionMs || 0,
+        currentSong: body.currentSong || null,
+        currentCover: body.currentCover || null,
+        durationMs: body.durationMs || 0,
+        basePositionMs: body.basePositionMs || 0,
         baseTimestampMs: now.getTime(),
         playbackRate: 1,
         isPlaying: true,
         mongoLogId,
-        lastProbedAt: now.getTime(),
-        lastStateSyncAt: now.getTime(),
         lastHeartbeatAt: now.getTime(),
         updatedAt: Math.floor(now.getTime() / 1000)
       };
 
-      // 写入 Redis 缓存
+      // 写入 Redis（即使 Mongo 出错，Redis 依然能保证开播）
       await renewRoom(redis, newRoomPayload);
 
       return c.json({
@@ -150,6 +169,9 @@ app.post('/api/broadcast', async (c) => {
       }, 200);
     }
 
+    // ==========================================
+    // 分支 2：心跳保活 (action === 'heartbeat')
+    // ==========================================
     if (action === 'heartbeat') {
       const roomOwner = currentRoom ? (currentRoom.publisher || currentRoom.inviter) : null;
       if (currentRoom && roomOwner === username) {
@@ -157,7 +179,6 @@ app.post('/api/broadcast', async (c) => {
         currentRoom.updatedAt = Math.floor(now / 1000);
         currentRoom.lastHeartbeatAt = now;
 
-        // 如果客户端在心跳中顺带携带了正在播放的歌曲，更新至 Redis
         if (body.currentSong !== undefined) {
           currentRoom.currentSong = body.currentSong;
           currentRoom.currentCover = body.currentCover;
@@ -165,7 +186,6 @@ app.post('/api/broadcast', async (c) => {
           currentRoom.basePositionMs = body.basePositionMs || 0;
           currentRoom.baseTimestampMs = now;
           currentRoom.isPlaying = body.isPlaying ?? true;
-          currentRoom.playbackRate = body.playbackRate || 1;
         }
 
         await renewRoom(redis, currentRoom);
@@ -174,23 +194,35 @@ app.post('/api/broadcast', async (c) => {
       return c.json({ code: 404, message: '房间已失效或不是房主' }, 404);
     }
 
+    // ==========================================
+    // 分支 3：关闭房间 (action === 'stop' | 'expire')
+    // ==========================================
     if (action === 'stop' || action === 'expire') {
       const roomOwner = currentRoom ? (currentRoom.publisher || currentRoom.inviter) : null;
-      if (currentRoom && roomOwner === username) {
-        await redis.del(REDIS_ROOM_KEY);
-        await archiveRoomLog(env, currentRoom, action === 'stop' ? 'manual' : 'timeout');
-        return c.json({ code: 0, message: '房间已释放并归档' }, 200);
+      // 只要没有房间，或者请求者就是房主，立即安全清理
+      if (!currentRoom || roomOwner === username) {
+        try {
+          await redis.del(REDIS_ROOM_KEY);
+        } catch (_) {}
+        if (currentRoom) {
+          await archiveRoomLog(env, currentRoom, action === 'stop' ? 'manual' : 'timeout');
+        }
+        return c.json({ code: 0, message: '房间已安全释放' }, 200);
       }
       return c.json({ code: 0, message: '非房主请求已忽略' }, 200);
     }
 
     return c.json({ code: 0, message: 'ok' }, 200);
+
   } catch (error) {
-    console.error('[Broadcast API Error]', error);
-    return c.json({ code: 500, message: `服务器开播异常: ${error.message}` }, 500);
+    console.error('[Broadcast API Error 严重崩溃]', error);
+    // ⚡ 彻底消灭黑盒：万一出错，直接抛出真实的报错信息，供排查
+    return c.json({
+      code: 500,
+      message: `服务端开播崩溃: ${error.name} - ${error.message}`
+    }, 500);
   }
 });
-
 // ----------------------------------------------------
 // 路由：/api/room/status (⚡ 纯净只读版，2ms 极速响应)
 // ----------------------------------------------------
