@@ -160,5 +160,16 @@ check('room-hub.js 不 import getDatabase', !/getDatabase/.test(hubSource));
 check('room-hub.js 不 import redis', !/lib\/redis/.test(hubSource));
 check('room-hub.js 不做任何出站 fetch', !/\.fetch\(['"]https?:/.test(hubSource));
 
+console.log('\n[11] 静态约束：Mongo 连接不得缓存在模块作用域');
+// Cloudflare 按「请求」划分 I/O 上下文。模块级缓存的 MongoClient 在后续请求里复用，
+// 会让请求永不返回（500 "code had hung"）；同一请求里再调 DO 则直接抛
+// "Cannot perform I/O on behalf of a different Durable Object"。
+// 实测表现为「一次成功、一次挂死」交替 —— 旧版成员列表在 1 人和 2 人之间横跳的根因。
+const mongoSource = readFileSync(new URL('../src/lib/mongodb.js', import.meta.url), 'utf8');
+check('模块级没有 client 变量', !/^let\s+\w*[Cc]lient\s*=/m.test(mongoSource));
+check('模块级没有 cachedRedis 式的连接缓存', !/^let\s+cached/m.test(mongoSource));
+check('导出 closeDatabase 供请求收尾', /export async function closeDatabase/.test(mongoSource));
+check('getDatabase 接收 Hono 上下文而非 env', /export async function getDatabase\(c\)/.test(mongoSource));
+
 console.log(`\n${failures === 0 ? '全部通过' : failures + ' 项失败'}`);
 process.exit(failures === 0 ? 0 : 1);

@@ -1,19 +1,20 @@
 import { Redis } from '@upstash/redis';
 
-let cachedRedis = null;
-
+/**
+ * 每次调用都新建一个 Upstash 客户端。
+ *
+ * 这里以前做的是模块级单例。Upstash 走的是 REST（内部就是 fetch），本身不持有
+ * 长连接，所以它不像 MongoClient 那样会踩到「跨请求复用 I/O 上下文」的坑；
+ * 但构造这个对象的成本接近于零，索性也一并去掉缓存，免得日后有人照抄这个
+ * 模式去缓存真正持连接的东西。
+ */
 export function getRedis(env) {
   const url = env.UPSTASH_REDIS_REST_URL || env.KV_REST_API_URL;
   const token = env.UPSTASH_REDIS_REST_TOKEN || env.KV_REST_API_TOKEN;
   if (!url || !token) {
     throw new Error('[Redis] 未配置 UPSTASH_REDIS_REST_URL 或 UPSTASH_REDIS_REST_TOKEN');
   }
-
-  // ⚡ 单例模式：避免每次进入接口都重复创建 Redis 实例
-  if (!cachedRedis) {
-    cachedRedis = new Redis({ url, token });
-  }
-  return cachedRedis;
+  return new Redis({ url, token });
 }
 
 // ============================================================

@@ -39,7 +39,7 @@ export function readClaims(env, request, url) {
  * JWT 里的 username 是签发那一刻的快照，用户改过昵称后就是脏数据，
  * 所以展示用的昵称/头像一律以数据库为准，读不到才降级用 JWT 声明。
  */
-export async function loadProfile(env, claims) {
+export async function loadProfile(c, claims) {
   const qq = String(claims.qq);
   const fallback = {
     qq,
@@ -48,7 +48,7 @@ export async function loadProfile(env, claims) {
   };
 
   try {
-    const db = await getDatabase(env);
+    const db = await getDatabase(c);
     const user = await db.collection('users').findOne(
       { qq },
       { projection: { username: 1, avatarUrl: 1 } }

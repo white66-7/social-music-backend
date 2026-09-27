@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import bcrypt from 'bcryptjs';
 
-import { getDatabase } from './lib/mongodb.js';
+import { getDatabase, closeDatabase } from './lib/mongodb.js';
 import {
   getRedis,
   getLoginFailCount,
@@ -43,6 +43,16 @@ app.use('*', async (c, next) => {
   return corsMiddleware(c, next);
 });
 
+// Mongo 连接是按请求创建的（见 lib/mongodb.js 的说明：跨请求复用会让请求永久挂死），
+// 所以每个请求结束都必须把它关掉，否则会持续泄漏到 Atlas 的连接。
+app.use('*', async (c, next) => {
+  try {
+    await next();
+  } finally {
+    await closeDatabase(c);
+  }
+});
+
 app.get('/api/health', (c) => c.json({ code: 0, message: 'ok', time: Date.now() }, 200));
 
 // ----------------------------------------------------
@@ -55,10 +65,10 @@ app.get('/api/health', (c) => c.json({ code: 0, message: 'ok', time: Date.now() 
 // 顺序上同样要小心：日志一律在 RoomHub 校验通过之后才写，
 // 否则任何人拿别人正在放歌的 roomId 反复调 start 就能改写那条历史。
 // ----------------------------------------------------
-async function openRoomLog(env, { roomId, publisher, inviter, hostAvatarUrl, deepLink }) {
+async function openRoomLog(c, { roomId, publisher, inviter, hostAvatarUrl, deepLink }) {
   const now = new Date();
   try {
-    const db = await getDatabase(env);
+    const db = await getDatabase(c);
     await db.collection('room_logs').findOneAndUpdate(
       { roomId },
       {
@@ -85,9 +95,9 @@ async function openRoomLog(env, { roomId, publisher, inviter, hostAvatarUrl, dee
  * 收尾当前活动房间的历史记录。
  * 全站同时只允许一个房间，所以不需要 roomId 也能精确定位。
  */
-async function endActiveRoomLog(env, reason) {
+async function endActiveRoomLog(c, reason) {
   try {
-    const db = await getDatabase(env);
+    const db = await getDatabase(c);
     await db.collection('room_logs').updateMany(
       { status: 'active' },
       {
@@ -110,11 +120,11 @@ async function endActiveRoomLog(env, reason) {
 let lastStaleSweepAt = 0;
 const STALE_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
-async function sweepStaleRoomLogs(env) {
+async function sweepStaleRoomLogs(c) {
   const now = Date.now();
   if (now - lastStaleSweepAt < STALE_SWEEP_INTERVAL_MS) return;
   lastStaleSweepAt = now;
-  await endActiveRoomLog(env, 'timeout');
+  await endActiveRoomLog(c, 'timeout');
 }
 
 // ----------------------------------------------------
@@ -144,7 +154,7 @@ app.post('/api/auth/login', async (c) => {
       return c.json({ code: 429, message: '口令错误次数过多，请 10 分钟后再试' }, 429);
     }
 
-    const db = await getDatabase(env);
+    const db = await getDatabase(c);
     const usersCollection = db.collection('users');
     const existingUser = await usersCollection.findOne({ qq: cleanQq });
 
@@ -221,7 +231,7 @@ app.post('/api/auth/login', async (c) => {
 // 路由：/api/user/me
 // ----------------------------------------------------
 app.get('/api/user/me', requireAuth(), async (c) => {
-  const profile = await loadProfile(c.env, c.get('claims'));
+  const profile = await loadProfile(c, c.get('claims'));
   return c.json({ code: 0, data: profile }, 200);
 });
 
@@ -233,7 +243,7 @@ app.get('/api/user/me', requireAuth(), async (c) => {
 // ----------------------------------------------------
 app.get('/api/user/list', requireAuth(), async (c) => {
   try {
-    const db = await getDatabase(c.env);
+    const db = await getDatabase(c);
 
     const usersPromise = db.collection('users')
       .aggregate([
@@ -284,10 +294,10 @@ app.get('/api/user/list', requireAuth(), async (c) => {
 // ----------------------------------------------------
 app.post('/api/user/sync', requireAuth(), async (c) => {
   try {
-    const profile = await loadProfile(c.env, c.get('claims'));
+    const profile = await loadProfile(c, c.get('claims'));
     const { username, avatarUrl } = await c.req.json().catch(() => ({}));
 
-    const db = await getDatabase(c.env);
+    const db = await getDatabase(c);
     const now = Date.now();
 
     const updateDoc = {
@@ -326,7 +336,7 @@ app.post('/api/user/sync', requireAuth(), async (c) => {
 // ----------------------------------------------------
 app.post('/api/user/update-name', requireAuth(), async (c) => {
   try {
-    const profile = await loadProfile(c.env, c.get('claims'));
+    const profile = await loadProfile(c, c.get('claims'));
     const { newUsername } = await c.req.json().catch(() => ({}));
     const cleanName = String(newUsername || '').trim();
 
@@ -337,7 +347,7 @@ app.post('/api/user/update-name', requireAuth(), async (c) => {
       return c.json({ code: 400, message: '昵称最多 12 个字' }, 400);
     }
 
-    const db = await getDatabase(c.env);
+    const db = await getDatabase(c);
     const now = Date.now();
 
     await db.collection('users').updateOne(
@@ -364,7 +374,7 @@ app.post('/api/user/update-name', requireAuth(), async (c) => {
 app.get('/api/room/history', requireAuth(), async (c) => {
   try {
     const limit = Math.min(parseInt(c.req.query('limit')) || 10, 30);
-    const db = await getDatabase(c.env);
+    const db = await getDatabase(c);
 
     const history = await db.collection('room_logs')
       .find({})
@@ -397,13 +407,13 @@ app.get('/api/room/history', requireAuth(), async (c) => {
 // ----------------------------------------------------
 app.get('/api/room/state', requireAuth(), async (c) => {
   try {
-    const profile = await loadProfile(c.env, c.get('claims'));
+    const profile = await loadProfile(c, c.get('claims'));
     const res = await getHubStub(c.env).fetch('https://room-hub/state');
     const snapshot = await res.json();
 
     // 权威状态说没有房间，但历史里还有 active —— 那是房主被超时回收了
     if (!snapshot.room) {
-      await sweepStaleRoomLogs(c.env);
+      await sweepStaleRoomLogs(c);
     }
 
     return c.json({ code: 0, ...snapshot, me: profile }, 200);
@@ -435,7 +445,7 @@ app.get('/api/room/ws', async (c) => {
 // ----------------------------------------------------
 app.post('/api/room/host/start', requireAuth(), async (c) => {
   try {
-    const profile = await loadProfile(c.env, c.get('claims'));
+    const profile = await loadProfile(c, c.get('claims'));
     const { roomId, inviter, secret, deepLink, serverUrl } = await c.req.json().catch(() => ({}));
 
     const cleanRoomId = String(roomId || '').trim();
@@ -463,7 +473,7 @@ app.post('/api/room/host/start', requireAuth(), async (c) => {
 
     // 只有 RoomHub 确认房间归我（没被 409 挡下）才记历史
     if (res.ok) {
-      await openRoomLog(c.env, {
+      await openRoomLog(c, {
         roomId: cleanRoomId,
         publisher: profile.username,
         inviter: inviter || profile.username,
@@ -517,7 +527,7 @@ app.post('/api/room/host/stop', requireAuth(), async (c) => {
     const data = await res.json();
 
     if (res.ok) {
-      await endActiveRoomLog(c.env, 'manual');
+      await endActiveRoomLog(c, 'manual');
     }
 
     return c.json(data, res.status);
