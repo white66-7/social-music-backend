@@ -5,7 +5,7 @@ import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 
 import { getDatabase } from './lib/mongodb.js';
-import { getRedis, REDIS_ROOM_KEY, loadRoom, renewRoom, updateRoomMeta } from './lib/redis.js';
+import { getRedis, REDIS_ROOM_KEY, loadRoom, renewRoom } from './lib/redis.js';
 import { checkRoomExists, verifyRoomSecret } from './lib/neri.js';
 
 const app = new Hono();
@@ -29,7 +29,7 @@ app.use('*', cors({
   credentials: true,
 }));
 
-// 辅助函数：安全归档日志（全面 try-catch 隔离，防止拖垮接口）
+// 辅助函数：安全归档日志（全面隔离，即使出错也不中断响应）
 async function archiveRoomLog(env, room, endReason) {
   if (!room?.mongoLogId) return;
   try {
@@ -39,12 +39,12 @@ async function archiveRoomLog(env, room, endReason) {
       { $set: { status: 'ended', endedAt: new Date(), endReason } }
     );
   } catch (e) {
-    console.warn('[MongoDB 警告] 归档失败:', e.message);
+    console.warn('[MongoDB 警告] 归档日志失败:', e.message);
   }
 }
 
 // ----------------------------------------------------
-// 路由：/api/broadcast
+// 路由：/api/broadcast (⚡ 极速稳定版，无审核助手，杜绝 500)
 // ----------------------------------------------------
 app.post('/api/broadcast', async (c) => {
   const env = c.env;
@@ -62,7 +62,8 @@ app.post('/api/broadcast', async (c) => {
 
     if (action === 'start') {
       const roomOwner = currentRoom ? (currentRoom.publisher || currentRoom.inviter) : null;
-      if (currentRoom && roomOwner !== username) {
+      // 如果当前已有其他人在放歌，且不是当前申请人
+      if (currentRoom && roomOwner && roomOwner !== username) {
         return c.json({
           code: 409,
           message: `当前已有其他人在放歌【${currentRoom.inviter || roomOwner}】`
@@ -73,34 +74,11 @@ app.post('/api/broadcast', async (c) => {
         return c.json({ code: 400, message: '缺少房间链接或房间号' }, 400);
       }
 
-      let probeResult;
-      if (resume) {
-        // ⚡ 恢复时传入密钥进行安全探活，避免误判
-        const exists = await checkRoomExists(serverUrl, roomId, secret || currentRoom?.secret);
-        probeResult = exists === 'dead'
-          ? { ok: false, message: '房间已关闭或不存在，无法恢复' }
-          : {
-              ok: true,
-              currentSong: currentRoom?.currentSong || null,
-              currentCover: currentRoom?.currentCover || null,
-              durationMs: currentRoom?.durationMs || 0,
-              basePositionMs: currentRoom?.basePositionMs || 0,
-              baseTimestampMs: currentRoom?.baseTimestampMs || Date.now(),
-              playbackRate: currentRoom?.playbackRate || 1,
-              isPlaying: currentRoom?.isPlaying ?? true,
-            };
-      } else {
-        probeResult = await verifyRoomSecret(serverUrl, roomId, secret);
-      }
-
-      if (!probeResult.ok) {
-        return c.json({ code: 400, message: probeResult.message }, 400);
-      }
-
       let hostAvatarUrl = '';
       let mongoLogId = null;
       const now = new Date();
 
+      // ⚡ 将 MongoDB 彻底隔离包裹：即使 Mongo 断连、超时，绝不阻断开播！
       try {
         const db = await getDatabase(env);
 
@@ -135,10 +113,11 @@ app.post('/api/broadcast', async (c) => {
           });
           mongoLogId = insertResult.insertedId.toString();
         }
-      } catch (err) {
-        console.warn('[MongoDB 警告] 记录日志失败:', err.message);
+      } catch (dbErr) {
+        console.warn('[MongoDB 警告] 用户查询或写入日志失败（已跳过，保证开播）:', dbErr.message);
       }
 
+      // ⚡ 构建广播载荷：直接采用前端提交的信息，秒级上线
       const newRoomPayload = {
         roomId,
         inviter: inviter || username,
@@ -147,13 +126,13 @@ app.post('/api/broadcast', async (c) => {
         secret: secret || '',
         deepLink,
         serverUrl: serverUrl || '',
-        currentSong: probeResult.currentSong || null,
-        currentCover: probeResult.currentCover || null,
-        durationMs: probeResult.durationMs || 0,
-        basePositionMs: probeResult.basePositionMs || 0,
-        baseTimestampMs: probeResult.baseTimestampMs || now.getTime(),
-        playbackRate: probeResult.playbackRate || 1,
-        isPlaying: probeResult.isPlaying ?? true,
+        currentSong: body.currentSong || currentRoom?.currentSong || null,
+        currentCover: body.currentCover || currentRoom?.currentCover || null,
+        durationMs: body.durationMs || currentRoom?.durationMs || 0,
+        basePositionMs: body.basePositionMs || currentRoom?.basePositionMs || 0,
+        baseTimestampMs: now.getTime(),
+        playbackRate: 1,
+        isPlaying: true,
         mongoLogId,
         lastProbedAt: now.getTime(),
         lastStateSyncAt: now.getTime(),
@@ -161,6 +140,7 @@ app.post('/api/broadcast', async (c) => {
         updatedAt: Math.floor(now.getTime() / 1000)
       };
 
+      // 写入 Redis 缓存
       await renewRoom(redis, newRoomPayload);
 
       return c.json({
@@ -177,7 +157,7 @@ app.post('/api/broadcast', async (c) => {
         currentRoom.updatedAt = Math.floor(now / 1000);
         currentRoom.lastHeartbeatAt = now;
 
-        // 如果心跳携带了最新播放状态，顺手同步至 Redis
+        // 如果客户端在心跳中顺带携带了正在播放的歌曲，更新至 Redis
         if (body.currentSong !== undefined) {
           currentRoom.currentSong = body.currentSong;
           currentRoom.currentCover = body.currentCover;
@@ -207,12 +187,12 @@ app.post('/api/broadcast', async (c) => {
     return c.json({ code: 0, message: 'ok' }, 200);
   } catch (error) {
     console.error('[Broadcast API Error]', error);
-    return c.json({ code: 500, message: '服务器内部错误' }, 500);
+    return c.json({ code: 500, message: `服务器开播异常: ${error.message}` }, 500);
   }
 });
 
 // ----------------------------------------------------
-// 路由：/api/room/status (⚡ 纯净极速只读版，2ms 极速响应，彻底消灭 500 报错)
+// 路由：/api/room/status (⚡ 纯净只读版，2ms 极速响应)
 // ----------------------------------------------------
 app.get('/api/room/status', async (c) => {
   const env = c.env;
@@ -238,7 +218,7 @@ app.get('/api/room/status', async (c) => {
       hostAvatarUrl: currentRoom.hostAvatarUrl,
       deepLink: currentRoom.deepLink,
       roomId: currentRoom.roomId,
-      secret: currentRoom.secret || '', // ⚡ 派发密钥供前端 WebSocket 直连使用
+      secret: currentRoom.secret || '', // ⚡ 派发密钥供前端 WebSocket 直连
       serverUrl: currentRoom.serverUrl || '',
       currentSong: currentRoom.currentSong || null,
       currentCover: currentRoom.currentCover || null,
@@ -251,7 +231,6 @@ app.get('/api/room/status', async (c) => {
 
   } catch (error) {
     console.error('[Room Status API Error]', error);
-    // 兜底返回空闲，绝不抛出 500
     return c.json({ exists: false }, 200);
   }
 });
