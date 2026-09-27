@@ -1,6 +1,4 @@
 const DEFAULT_NERI_SERVER = 'https://neriplayer.hancat.work';
-
-// 探活专用固定 UUID
 const PROBE_UUID = '00000000-0000-4000-8000-000000000000';
 
 function normalizeBase(serverUrl) {
@@ -22,9 +20,6 @@ async function postJoin(base, roomId, body, timeoutMs) {
   });
 }
 
-/**
- * 从 NeriPlayer 的 state 结构中精确提取歌曲与锚点播放进度
- */
 export function extractPlaybackInfo(state) {
   if (!state) return null;
 
@@ -57,9 +52,6 @@ export function extractPlaybackInfo(state) {
   };
 }
 
-/**
- * 只读探活：POST /join 故意不带密钥，三态判定
- */
 export async function checkRoomExists(serverUrl, roomId) {
   const base = normalizeBase(serverUrl);
   try {
@@ -78,9 +70,6 @@ export async function checkRoomExists(serverUrl, roomId) {
   }
 }
 
-/**
- * 静默获取当前房间最新歌曲与进度（带密钥进房 -> 取数据 -> 强制 await 离房）
- */
 export async function fetchCurrentRoomState(serverUrl, roomId, secret) {
   const base = normalizeBase(serverUrl);
   let token = null;
@@ -105,7 +94,6 @@ export async function fetchCurrentRoomState(serverUrl, roomId, secret) {
   } catch (e) {
     return null;
   } finally {
-    // ⚠️ 关键：Vercel 下必须 await，否则函数休眠导致请求被掐断，残留幽灵成员
     if (token) {
       try {
         await fetch(`${base}/api/rooms/${encodeURIComponent(roomId)}/leave`, {
@@ -123,9 +111,6 @@ export async function fetchCurrentRoomState(serverUrl, roomId, secret) {
   }
 }
 
-/**
- * 开播核验并初始抓取歌曲与进度
- */
 export async function verifyRoomSecret(serverUrl, roomId, secret) {
   const base = normalizeBase(serverUrl);
   let token = null;
@@ -187,5 +172,3 @@ export async function verifyRoomSecret(serverUrl, roomId, secret) {
     }
   }
 }
-
-export { DEFAULT_NERI_SERVER };
