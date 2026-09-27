@@ -52,18 +52,21 @@ export function extractPlaybackInfo(state) {
   };
 }
 
-export async function checkRoomExists(serverUrl, roomId) {
+/**
+ * ⚡ 修复探活误杀逻辑：支持传入 secret，并将 400/403 判定为活着，杜绝误杀
+ */
+export async function checkRoomExists(serverUrl, roomId, secret = '') {
   const base = normalizeBase(serverUrl);
   try {
-    const response = await postJoin(
-      base,
-      roomId,
-      { userUuid: PROBE_UUID, nickname: '审核助手' },
-      3500
-    );
+    const payload = { userUuid: PROBE_UUID, nickname: '审核助手' };
+    if (secret) payload.joinSecret = secret.trim();
 
-    if (response.status === 403) return 'alive';
-    if ([400, 404, 410].includes(response.status)) return 'dead';
+    const response = await postJoin(base, roomId, payload, 3500);
+
+    // 200 成功 / 403 拒绝 / 400 提示需要口令，均代表房间存在
+    if ([200, 400, 403].includes(response.status)) return 'alive';
+    // 404 未找到 / 410 已解散，代表房间已彻底死亡
+    if ([404, 410].includes(response.status)) return 'dead';
     return 'unknown';
   } catch (_) {
     return 'unknown';

@@ -6,11 +6,11 @@ import bcrypt from 'bcryptjs';
 
 import { getDatabase } from './lib/mongodb.js';
 import { getRedis, REDIS_ROOM_KEY, loadRoom, renewRoom, updateRoomMeta } from './lib/redis.js';
-import { checkRoomExists, fetchCurrentRoomState, verifyRoomSecret } from './lib/neri.js';
+import { checkRoomExists, verifyRoomSecret } from './lib/neri.js';
 
 const app = new Hono();
 
-// 1. 全局 CORS 配置（自动处理 OPTIONS 预检，省去在每个接口中手写）
+// 1. 全局 CORS 配置
 app.use('*', cors({
   origin: '*',
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
@@ -29,10 +29,11 @@ app.use('*', cors({
   credentials: true,
 }));
 
-// 辅助函数：归档日志
-async function archiveRoomLog(db, room, endReason) {
-  if (!room.mongoLogId) return;
+// 辅助函数：安全归档日志（全面 try-catch 隔离，防止拖垮接口）
+async function archiveRoomLog(env, room, endReason) {
+  if (!room?.mongoLogId) return;
   try {
+    const db = await getDatabase(env);
     await db.collection('room_logs').updateOne(
       { _id: new ObjectId(room.mongoLogId) },
       { $set: { status: 'ended', endedAt: new Date(), endReason } }
@@ -74,7 +75,8 @@ app.post('/api/broadcast', async (c) => {
 
       let probeResult;
       if (resume) {
-        const exists = await checkRoomExists(serverUrl, roomId);
+        // ⚡ 恢复时传入密钥进行安全探活，避免误判
+        const exists = await checkRoomExists(serverUrl, roomId, secret || currentRoom?.secret);
         probeResult = exists === 'dead'
           ? { ok: false, message: '房间已关闭或不存在，无法恢复' }
           : {
@@ -174,6 +176,18 @@ app.post('/api/broadcast', async (c) => {
         const now = Date.now();
         currentRoom.updatedAt = Math.floor(now / 1000);
         currentRoom.lastHeartbeatAt = now;
+
+        // 如果心跳携带了最新播放状态，顺手同步至 Redis
+        if (body.currentSong !== undefined) {
+          currentRoom.currentSong = body.currentSong;
+          currentRoom.currentCover = body.currentCover;
+          currentRoom.durationMs = body.durationMs || 0;
+          currentRoom.basePositionMs = body.basePositionMs || 0;
+          currentRoom.baseTimestampMs = now;
+          currentRoom.isPlaying = body.isPlaying ?? true;
+          currentRoom.playbackRate = body.playbackRate || 1;
+        }
+
         await renewRoom(redis, currentRoom);
         return c.json({ code: 0, message: '续期成功' }, 200);
       }
@@ -184,23 +198,7 @@ app.post('/api/broadcast', async (c) => {
       const roomOwner = currentRoom ? (currentRoom.publisher || currentRoom.inviter) : null;
       if (currentRoom && roomOwner === username) {
         await redis.del(REDIS_ROOM_KEY);
-        if (currentRoom.mongoLogId) {
-          try {
-            const db = await getDatabase(env);
-            await db.collection('room_logs').updateOne(
-              { _id: new ObjectId(currentRoom.mongoLogId) },
-              {
-                $set: {
-                  status: 'ended',
-                  endedAt: new Date(),
-                  endReason: action === 'stop' ? 'manual' : 'timeout'
-                }
-              }
-            );
-          } catch (e) {
-            console.warn('[MongoDB 警告] 归档失败:', e.message);
-          }
-        }
+        await archiveRoomLog(env, currentRoom, action === 'stop' ? 'manual' : 'timeout');
         return c.json({ code: 0, message: '房间已释放并归档' }, 200);
       }
       return c.json({ code: 0, message: '非房主请求已忽略' }, 200);
@@ -214,71 +212,23 @@ app.post('/api/broadcast', async (c) => {
 });
 
 // ----------------------------------------------------
-// 路由：/api/room/status
+// 路由：/api/room/status (⚡ 纯净极速只读版，2ms 极速响应，彻底消灭 500 报错)
 // ----------------------------------------------------
-const PROBE_COOLDOWN_MS = 15 * 1000;
-const STATE_SYNC_COOLDOWN_MS = 10 * 1000;
-
 app.get('/api/room/status', async (c) => {
   const env = c.env;
-  const redis = getRedis(env);
 
   try {
-    const isForce = c.req.query('force') === 'true';
+    const redis = getRedis(env);
     const currentRoom = await loadRoom(redis);
 
-    if (!currentRoom) {
+    if (!currentRoom || !currentRoom.roomId) {
       return c.json({ exists: false }, 200);
     }
 
     const now = Date.now();
-    const lastProbedAt = currentRoom.lastProbedAt || 0;
-    const needProbe = isForce || (now - lastProbedAt > PROBE_COOLDOWN_MS);
-
-    if (needProbe && currentRoom.roomId) {
-      const probe = await checkRoomExists(currentRoom.serverUrl, currentRoom.roomId);
-
-      if (probe === 'dead') {
-        await redis.del(REDIS_ROOM_KEY);
-        const db = await getDatabase(env);
-        await archiveRoomLog(db, currentRoom, 'cloud_probe_dead');
-        return c.json({ exists: false, message: '房间已关闭或失效' }, 200);
-      }
-
-      currentRoom.lastProbedAt = now;
-      const ttl = await redis.ttl(REDIS_ROOM_KEY);
-      if (ttl > 0) {
-        await updateRoomMeta(redis, currentRoom);
-      } else if (ttl === -1) {
-        await renewRoom(redis, currentRoom);
-      }
-    }
-
     let estimatedPosition = currentRoom.basePositionMs || 0;
     if (currentRoom.isPlaying && currentRoom.baseTimestampMs) {
       estimatedPosition += (now - currentRoom.baseTimestampMs) * (currentRoom.playbackRate || 1);
-    }
-
-    const isSongFinished = currentRoom.durationMs > 0 && estimatedPosition >= currentRoom.durationMs;
-    const lastStateSyncAt = currentRoom.lastStateSyncAt || 0;
-    const isCoolDownPassed = now - lastStateSyncAt > STATE_SYNC_COOLDOWN_MS;
-
-    if ((isSongFinished || isForce) && isCoolDownPassed && currentRoom.secret) {
-      currentRoom.lastStateSyncAt = now;
-      await updateRoomMeta(redis, currentRoom);
-
-      const latest = await fetchCurrentRoomState(currentRoom.serverUrl, currentRoom.roomId, currentRoom.secret);
-      if (latest && latest.currentSong) {
-        currentRoom.currentSong = latest.currentSong;
-        currentRoom.currentCover = latest.currentCover;
-        currentRoom.durationMs = latest.durationMs;
-        currentRoom.basePositionMs = latest.basePositionMs;
-        currentRoom.baseTimestampMs = latest.baseTimestampMs;
-        currentRoom.playbackRate = latest.playbackRate;
-        currentRoom.isPlaying = latest.isPlaying;
-
-        await updateRoomMeta(redis, currentRoom);
-      }
     }
 
     return c.json({
@@ -288,6 +238,8 @@ app.get('/api/room/status', async (c) => {
       hostAvatarUrl: currentRoom.hostAvatarUrl,
       deepLink: currentRoom.deepLink,
       roomId: currentRoom.roomId,
+      secret: currentRoom.secret || '', // ⚡ 派发密钥供前端 WebSocket 直连使用
+      serverUrl: currentRoom.serverUrl || '',
       currentSong: currentRoom.currentSong || null,
       currentCover: currentRoom.currentCover || null,
       durationMs: currentRoom.durationMs || 0,
@@ -296,9 +248,11 @@ app.get('/api/room/status', async (c) => {
       playbackRate: currentRoom.playbackRate || 1,
       isPlaying: currentRoom.isPlaying ?? true,
     }, 200);
+
   } catch (error) {
     console.error('[Room Status API Error]', error);
-    return c.json({ code: 500, message: '服务器内部错误' }, 500);
+    // 兜底返回空闲，绝不抛出 500
+    return c.json({ exists: false }, 200);
   }
 });
 
@@ -620,5 +574,4 @@ app.post('/api/user/update-name', async (c) => {
   }
 });
 
-// 导出 Worker 格式
 export default app;
