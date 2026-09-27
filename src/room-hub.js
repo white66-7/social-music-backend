@@ -11,6 +11,14 @@ export const ROOM_TTL_MS = 90_000;
 /** alarm 的巡检间隔，比 TTL 短，保证超时能被及时发现 */
 const ALARM_INTERVAL_MS = 30_000;
 
+/** 主动去播放器服务器确认「房间还在不在」的间隔 */
+const EXISTENCE_CHECK_INTERVAL_MS = 60_000;
+
+/** 探测请求的超时，避免外部服务卡住把 alarm 拖死 */
+const EXISTENCE_CHECK_TIMEOUT_MS = 8_000;
+
+const FALLBACK_NERI_SERVER = 'https://neriplayer.hancat.work';
+
 const HUB_INSTANCE_NAME = 'hub';
 
 export function getHubStub(env) {
@@ -57,6 +65,7 @@ export class RoomHub {
     this.env = env;
     this.room = null;
     this.version = 0;
+    this.lastExistenceCheckAt = 0;
 
     // DO 可能被回收后再唤醒，构造时先把权威状态从存储里捞回来，
     // 期间阻塞其它事件，防止半初始化状态下对外广播错数据。
@@ -359,7 +368,49 @@ export class RoomHub {
       return;
     }
 
+    await this.verifyRoomStillExists();
+
     await this.ensureAlarm();
+  }
+
+  /**
+   * 主动向播放器服务器确认房间是否还在，不在就直接关房。
+   *
+   * 为什么需要这个：房主 App 可能被杀掉、也可能它自己的 Neri 长连接一直在
+   * 静默重试，这时光靠心跳是发现不了「外部房间早就没了」的 ——
+   * 房间会一直挂在「正在放歌」而且谁也关不掉。
+   *
+   * 用的是 GET /api/rooms/{id}/state 这个只读接口。
+   * 不能用 join 来探测：那会往房间里塞进一个机器人，正是要避免的东西。
+   */
+  async verifyRoomStillExists() {
+    const room = this.room;
+    if (!room?.roomId) return;
+
+    const now = Date.now();
+    if (now - this.lastExistenceCheckAt < EXISTENCE_CHECK_INTERVAL_MS) return;
+    this.lastExistenceCheckAt = now;
+
+    const base = (room.serverUrl || this.env.DEFAULT_NERI_SERVER || FALLBACK_NERI_SERVER)
+      .trim()
+      .replace(/\/+$/, '');
+    const url = `${base}/api/rooms/${encodeURIComponent(room.roomId)}/state`;
+
+    try {
+      const res = await fetch(url, {
+        method: 'GET',
+        signal: AbortSignal.timeout(EXISTENCE_CHECK_TIMEOUT_MS)
+      });
+
+      if (res.status === 404 || res.status === 410) {
+        console.warn(`[RoomHub] 播放器服务器报告房间 ${room.roomId} 已不存在，自动关房`);
+        await this.closeRoom('room_gone');
+      }
+      // 其它状态码（含 5xx）一律不下结论，等下一轮
+    } catch (e) {
+      // 网络抖动不该误判成「房间没了」
+      console.warn('[RoomHub] 房间存活探测失败（忽略本轮）:', e.message);
+    }
   }
 
   async closeRoom(reason) {

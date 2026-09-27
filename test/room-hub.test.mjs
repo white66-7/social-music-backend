@@ -148,6 +148,44 @@ const before = ctx.sockets[0].sent.length;
 await hub.fetch(post('/host/stop', { user: A }));
 check('没有多余广播', ctx.sockets[0].sent.length === before);
 
+console.log('\n[12] 播放器服务器报告房间已消失 → 后端自动关房');
+await hub.fetch(post('/host/start', {
+  user: A, roomId: 'gone01', inviter: '阿甲', secret: 's3cret',
+  deepLink: 'neriplayer://x?roomId=gone01', serverUrl: 'https://neri.test'
+}));
+snap = await (await hub.fetch(new Request('https://room-hub/state'))).json();
+check('房间已建立', snap.room?.roomId === 'gone01');
+
+const realFetch = globalThis.fetch;
+// 打桩：播放器服务器说这个房间不存在
+globalThis.fetch = async () => new Response('{"ok":false,"error":"room not initialized"}', { status: 404 });
+hub.lastExistenceCheckAt = 0;
+await hub.alarm();
+globalThis.fetch = realFetch;
+
+snap = await (await hub.fetch(new Request('https://room-hub/state'))).json();
+check('房间已被自动关闭', snap.room === null);
+check('关房原因是 room_gone', ctx.sockets.some(s => {
+  const m = s.last();
+  return m?.type === 'room_closed' && m.reason === 'room_gone';
+}));
+
+console.log('\n[12b] 探测失败（网络抖动）不得误判成房间没了');
+await hub.fetch(post('/host/start', {
+  user: A, roomId: 'alive01', inviter: '阿甲', secret: 's3cret',
+  deepLink: 'neriplayer://x?roomId=alive01', serverUrl: 'https://neri.test'
+}));
+globalThis.fetch = async () => { throw new Error('network down'); };
+hub.lastExistenceCheckAt = 0;
+await hub.alarm();
+globalThis.fetch = realFetch;
+
+snap = await (await hub.fetch(new Request('https://room-hub/state'))).json();
+check('网络异常时房间保留', snap.room?.roomId === 'alive01');
+
+// 收尾，避免影响后续静态检查以外的状态
+await hub.fetch(post('/host/stop', { user: A }));
+
 console.log('\n[10] 静态约束：DO 不得引入跨 I/O 上下文的依赖');
 // Durable Object 与 Worker 同 isolate 但属于不同 I/O 上下文。
 // 之前 DO 里调 getDatabase() 复用了 Worker 建立的 Mongo 连接，线上表现为
@@ -158,7 +196,9 @@ const hubSource = readFileSync(new URL('../src/room-hub.js', import.meta.url), '
 check('room-hub.js 不 import mongodb', !/from ['"]mongodb['"]/.test(hubSource));
 check('room-hub.js 不 import getDatabase', !/getDatabase/.test(hubSource));
 check('room-hub.js 不 import redis', !/lib\/redis/.test(hubSource));
-check('room-hub.js 不做任何出站 fetch', !/\.fetch\(['"]https?:/.test(hubSource));
+// 注意：出站 fetch 本身没问题 —— 每次调用都会创建属于本 DO 上下文的 I/O。
+// 真正致命的是「复用模块级缓存的连接对象」，那条约束在 [11] 里单独检查。
+check('room-hub.js 不缓存连接对象', !/^let\s+\w*[Cc]lient\s*=/m.test(hubSource));
 
 console.log('\n[11] 静态约束：Mongo 连接不得缓存在模块作用域');
 // Cloudflare 按「请求」划分 I/O 上下文。模块级缓存的 MongoClient 在后续请求里复用，
