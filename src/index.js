@@ -1,17 +1,22 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { ObjectId } from 'mongodb';
-import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 
 import { getDatabase } from './lib/mongodb.js';
-import { getRedis, REDIS_ROOM_KEY, loadRoom, renewRoom } from './lib/redis.js';
-import { checkRoomExists, verifyRoomSecret } from './lib/neri.js';
+import {
+  getRedis,
+  getLoginFailCount,
+  recordLoginFailure,
+  clearLoginFailures,
+  LOGIN_FAIL_LIMIT
+} from './lib/redis.js';
+import { signToken, readClaims, loadProfile, requireAuth } from './lib/auth.js';
+import { getHubStub } from './room-hub.js';
 
 const app = new Hono();
 
 // 1. 全局 CORS 配置
-app.use('*', cors({
+const corsMiddleware = cors({
   origin: '*',
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   allowHeaders: [
@@ -27,250 +32,264 @@ app.use('*', cors({
     'Authorization'
   ],
   credentials: true,
-}));
+});
 
-// 辅助函数：安全归档日志（全面隔离，即使出错也不中断响应）
-async function archiveRoomLog(env, room, endReason) {
-  if (!room?.mongoLogId) return;
-  try {
-    const db = await getDatabase(env);
-    await db.collection('room_logs').updateOne(
-      { _id: new ObjectId(room.mongoLogId) },
-      { $set: { status: 'ended', endedAt: new Date(), endReason } }
-    );
-  } catch (e) {
-    console.warn('[MongoDB 警告] 归档日志失败:', e.message);
+// WebSocket 握手返回的是 101，往它上面写 CORS 头会因响应头不可变而抛错，
+// 所以升级请求一律绕过 CORS 中间件 —— 握手本来也不受同源策略约束。
+app.use('*', async (c, next) => {
+  if ((c.req.header('Upgrade') || '').toLowerCase() === 'websocket') {
+    return next();
   }
-}
+  return corsMiddleware(c, next);
+});
+
+app.get('/api/health', (c) => c.json({ code: 0, message: 'ok', time: Date.now() }, 200));
+
+// 房间日志由 RoomHub 在校验完房间归属之后写入 —— 放在这里写的话，
+// 任何人拿别人正在放歌的 roomId 反复调 start 就能覆盖那条房间历史的发布者。
 
 // ----------------------------------------------------
-// 路由：/api/broadcast (⚡ 防 500 自愈版：彻底解决二次开房报错)
+// 路由：/api/auth/login
 // ----------------------------------------------------
-app.post('/api/broadcast', async (c) => {
+app.post('/api/auth/login', async (c) => {
   const env = c.env;
   const redis = getRedis(env);
 
   try {
-    const body = await c.req.json().catch(() => ({}));
-    const { action, username, roomId, inviter, publisher, secret, deepLink, serverUrl, resume } = body;
+    const { qq, username, pin } = await c.req.json().catch(() => ({}));
+    const cleanQq = String(qq || username || '').trim();
+    const cleanPin = String(pin || '').trim();
 
-    if (!action) {
-      return c.json({ code: 400, message: '缺少 action 参数' }, 400);
+    if (!cleanQq || !/^[1-9][0-9]{4,11}$/.test(cleanQq)) {
+      return c.json({ code: 400, message: '请输入合法的 QQ 号码' }, 400);
+    }
+    if (!cleanPin || cleanPin.length !== 4) {
+      return c.json({ code: 400, message: '请输入 4 位专属口令' }, 400);
     }
 
-    // ⚡ 1. 安全读取 Redis，防止读取或解析异常
-    let currentRoom = null;
-    try {
-      currentRoom = await loadRoom(redis);
-    } catch (_) {
-      currentRoom = null;
+    const failCount = await getLoginFailCount(redis, cleanQq);
+    if (failCount >= LOGIN_FAIL_LIMIT) {
+      return c.json({ code: 429, message: '口令错误次数过多，请 10 分钟后再试' }, 429);
     }
 
-    // ==========================================
-    // 分支 1：开启房间 (action === 'start')
-    // ==========================================
-    if (action === 'start') {
-      const roomOwner = currentRoom ? (currentRoom.publisher || currentRoom.inviter) : null;
-      // 如果当前已有其他人在放歌且不是房主本人
-      if (currentRoom && roomOwner && roomOwner !== username) {
-        return c.json({
-          code: 409,
-          message: `当前已有其他人在放歌【${currentRoom.inviter || roomOwner}】`
-        }, 409);
+    const db = await getDatabase(env);
+    const usersCollection = db.collection('users');
+    const existingUser = await usersCollection.findOne({ qq: cleanQq });
+
+    if (existingUser) {
+      const storedPin = typeof existingUser.pin === 'string' ? existingUser.pin : '';
+
+      // 这里以前有一条「首次绑定」旁路：storedPin 为空就无条件放行，
+      // 于是任何知道 QQ 号的人都能拿任意 4 位口令把这个账号认领走
+      //（响应里还会直接下发 30 天有效的 JWT，并把口令改成攻击者的）。
+      // 已核对生产库不存在无口令档案，因此直接删掉该旁路。
+      if (storedPin.length === 0) {
+        console.warn(`[Login] 账号 ${cleanQq} 没有口令，已拒绝登录（需人工重置）`);
       }
 
-      if (!deepLink || !roomId) {
-        return c.json({ code: 400, message: '缺少房间链接或房间号' }, 400);
+      // 非 bcrypt 的历史明文口令仍允许登录一次，成功后就地升级成哈希
+      const isMatch = storedPin.length > 0 && (storedPin.startsWith('$2')
+        ? await bcrypt.compare(cleanPin, storedPin)
+        : storedPin === cleanPin);
+
+      if (!isMatch) {
+        await recordLoginFailure(redis, cleanQq);
+        return c.json({ code: 403, message: '口令错误' }, 403);
       }
 
-      let hostAvatarUrl = '';
-      let mongoLogId = null;
-      const now = new Date();
+      await clearLoginFailures(redis, cleanQq);
 
-      // ⚡ 2. MongoDB 彻底隔离：即便数据库挂了、唯一索引冲突，也绝对不影响开播
-      try {
-        const db = await getDatabase(env);
-
-        if (username) {
-          const key = String(username);
-          const host = await db.collection('users').findOne(
-            { $or: [{ qq: key }, { username: key }] },
-            { projection: { avatarUrl: 1 } }
-          ).catch(() => null);
-          if (host?.avatarUrl) hostAvatarUrl = host.avatarUrl;
-        }
-
-        // ⚡ 关键自愈：插入日志时，即使二次开播遇到相同的 roomId 唯一索引，自动捕获降级，绝不抛出 500！
-        try {
-          const insertResult = await db.collection('room_logs').insertOne({
-            roomId,
-            publisher: username,
-            inviter: inviter || username,
-            hostAvatarUrl,
-            deepLink,
-            status: 'active',
-            startedAt: now,
-            endedAt: null,
-            endReason: null,
-          });
-          mongoLogId = insertResult.insertedId.toString();
-        } catch (insertErr) {
-          console.warn('[MongoDB] insertOne 存在旧记录或索引冲突，尝试更新既有日志:', insertErr.message);
-          // 如果有重复的 roomId，直接更新旧日志状态为 active
-          const updateResult = await db.collection('room_logs').findOneAndUpdate(
-            { roomId },
-            { 
-              $set: { 
-                status: 'active', 
-                publisher: username, 
-                inviter: inviter || username,
-                hostAvatarUrl,
-                startedAt: now, 
-                endedAt: null, 
-                endReason: null 
-              } 
-            },
-            { returnDocument: 'after' }
-          ).catch(() => null);
-          mongoLogId = updateResult?.value?._id?.toString() || updateResult?._id?.toString() || null;
-        }
-      } catch (dbErr) {
-        console.warn('[MongoDB 警告] 数据库操作完全跳过（已保证主流程顺畅）:', dbErr.message);
+      const updateData = { lastActiveAt: Date.now() };
+      if (!storedPin.startsWith('$2')) {
+        updateData.pin = await bcrypt.hash(cleanPin, 10);
       }
+      await usersCollection.updateOne({ qq: cleanQq }, { $set: updateData });
 
-      // ⚡ 3. 核心开播载荷（直接基于 Redis 保证毫秒级就绪）
-      const newRoomPayload = {
-        roomId,
-        inviter: inviter || username,
-        publisher: username,
-        hostAvatarUrl,
-        secret: secret || '',
-        deepLink,
-        serverUrl: serverUrl || '',
-        currentSong: body.currentSong || null,
-        currentCover: body.currentCover || null,
-        durationMs: body.durationMs || 0,
-        basePositionMs: body.basePositionMs || 0,
-        baseTimestampMs: now.getTime(),
-        playbackRate: 1,
-        isPlaying: true,
-        mongoLogId,
-        lastHeartbeatAt: now.getTime(),
-        updatedAt: Math.floor(now.getTime() / 1000)
-      };
-
-      // 写入 Redis（即使 Mongo 出错，Redis 依然能保证开播）
-      await renewRoom(redis, newRoomPayload);
+      const token = signToken(env, existingUser);
+      const { pin: _pin, _id, ...safeUser } = existingUser;
 
       return c.json({
         code: 0,
-        message: '房间开播成功',
-        data: newRoomPayload
+        message: '登录成功',
+        token,
+        user: safeUser
       }, 200);
     }
 
-    // ==========================================
-    // 分支 2：心跳保活 (action === 'heartbeat')
-    // ==========================================
-    if (action === 'heartbeat') {
-      const roomOwner = currentRoom ? (currentRoom.publisher || currentRoom.inviter) : null;
-      if (currentRoom && roomOwner === username) {
-        const now = Date.now();
-        currentRoom.updatedAt = Math.floor(now / 1000);
-        currentRoom.lastHeartbeatAt = now;
+    const defaultNickname = `网友_${cleanQq.slice(-4)}`;
+    const newUser = {
+      qq: cleanQq,
+      username: defaultNickname,
+      avatarUrl: `https://q1.qlogo.cn/g?b=qq&nk=${cleanQq}&s=640`,
+      pin: await bcrypt.hash(cleanPin, 10),
+      createdAt: Date.now(),
+      lastActiveAt: Date.now()
+    };
 
-        if (body.currentSong !== undefined) {
-          currentRoom.currentSong = body.currentSong;
-          currentRoom.currentCover = body.currentCover;
-          currentRoom.durationMs = body.durationMs || 0;
-          currentRoom.basePositionMs = body.basePositionMs || 0;
-          currentRoom.baseTimestampMs = now;
-          currentRoom.isPlaying = body.isPlaying ?? true;
-        }
+    await usersCollection.insertOne(newUser);
+    await clearLoginFailures(redis, cleanQq);
 
-        await renewRoom(redis, currentRoom);
-        return c.json({ code: 0, message: '续期成功' }, 200);
-      }
-      return c.json({ code: 404, message: '房间已失效或不是房主' }, 404);
-    }
-
-    // ==========================================
-    // 分支 3：关闭房间 (action === 'stop' | 'expire')
-    // ==========================================
-    if (action === 'stop' || action === 'expire') {
-      const roomOwner = currentRoom ? (currentRoom.publisher || currentRoom.inviter) : null;
-      // 只要没有房间，或者请求者就是房主，立即安全清理
-      if (!currentRoom || roomOwner === username) {
-        try {
-          await redis.del(REDIS_ROOM_KEY);
-        } catch (_) {}
-        if (currentRoom) {
-          await archiveRoomLog(env, currentRoom, action === 'stop' ? 'manual' : 'timeout');
-        }
-        return c.json({ code: 0, message: '房间已安全释放' }, 200);
-      }
-      return c.json({ code: 0, message: '非房主请求已忽略' }, 200);
-    }
-
-    return c.json({ code: 0, message: 'ok' }, 200);
-
-  } catch (error) {
-    console.error('[Broadcast API Error 严重崩溃]', error);
-    // ⚡ 彻底消灭黑盒：万一出错，直接抛出真实的报错信息，供排查
-    return c.json({
-      code: 500,
-      message: `服务端开播崩溃: ${error.name} - ${error.message}`
-    }, 500);
-  }
-});
-// ----------------------------------------------------
-// 路由：/api/room/status (⚡ 纯净只读版，2ms 极速响应)
-// ----------------------------------------------------
-app.get('/api/room/status', async (c) => {
-  const env = c.env;
-
-  try {
-    const redis = getRedis(env);
-    const currentRoom = await loadRoom(redis);
-
-    if (!currentRoom || !currentRoom.roomId) {
-      return c.json({ exists: false }, 200);
-    }
-
-    const now = Date.now();
-    let estimatedPosition = currentRoom.basePositionMs || 0;
-    if (currentRoom.isPlaying && currentRoom.baseTimestampMs) {
-      estimatedPosition += (now - currentRoom.baseTimestampMs) * (currentRoom.playbackRate || 1);
-    }
+    const token = signToken(env, newUser);
+    const { pin: _pin, _id, ...safeUser } = newUser;
 
     return c.json({
-      exists: true,
-      inviter: currentRoom.inviter,
-      publisher: currentRoom.publisher,
-      hostAvatarUrl: currentRoom.hostAvatarUrl,
-      deepLink: currentRoom.deepLink,
-      roomId: currentRoom.roomId,
-      secret: currentRoom.secret || '', // ⚡ 派发密钥供前端 WebSocket 直连
-      serverUrl: currentRoom.serverUrl || '',
-      currentSong: currentRoom.currentSong || null,
-      currentCover: currentRoom.currentCover || null,
-      durationMs: currentRoom.durationMs || 0,
-      basePositionMs: currentRoom.basePositionMs || 0,
-      baseTimestampMs: currentRoom.baseTimestampMs || now,
-      playbackRate: currentRoom.playbackRate || 1,
-      isPlaying: currentRoom.isPlaying ?? true,
+      code: 0,
+      message: '首次认证并绑定成功',
+      token,
+      user: safeUser
     }, 200);
 
   } catch (error) {
-    console.error('[Room Status API Error]', error);
-    return c.json({ exists: false }, 200);
+    console.error('[Login Error]', error);
+    return c.json({ code: 500, message: `服务器处理异常: ${error.message}` }, 500);
+  }
+});
+
+// ----------------------------------------------------
+// 路由：/api/user/me
+// ----------------------------------------------------
+app.get('/api/user/me', requireAuth(), async (c) => {
+  const profile = await loadProfile(c.env, c.get('claims'));
+  return c.json({ code: 0, data: profile }, 200);
+});
+
+// ----------------------------------------------------
+// 路由：/api/user/list —— 全部注册成员（在线状态来自 RoomHub 的实时连接）
+//
+// 这是「花名册」而不是「房间成员」：名单稳定，只有 isOnline / isHosting
+// 两个角标会随实时连接变化。
+// ----------------------------------------------------
+app.get('/api/user/list', requireAuth(), async (c) => {
+  try {
+    const db = await getDatabase(c.env);
+
+    const usersPromise = db.collection('users')
+      .aggregate([
+        { $match: { qq: { $type: 'string', $ne: '' } } },
+        {
+          $addFields: {
+            lastActiveAt: {
+              $convert: { input: '$lastActiveAt', to: 'long', onError: 0, onNull: 0 }
+            }
+          }
+        },
+        { $project: { pin: 0 } },
+        { $sort: { lastActiveAt: -1 } }
+      ])
+      .toArray();
+
+    const presencePromise = getHubStub(c.env)
+      .fetch('https://room-hub/members')
+      .then(r => r.json())
+      .catch(() => null);
+
+    const [users, presence] = await Promise.all([usersPromise, presencePromise]);
+
+    const online = new Set((presence?.members || []).map(m => m.qq));
+    const hostQq = (presence?.members || []).find(m => m.isHosting)?.qq || null;
+
+    const data = (users || []).map(u => {
+      const qq = String(u.qq);
+      return {
+        qq,
+        username: u.username || `网友_${qq.slice(-4)}`,
+        avatarUrl: u.avatarUrl || `https://q1.qlogo.cn/g?b=qq&nk=${qq}&s=640`,
+        isOnline: online.has(qq),
+        isHosting: Boolean(hostQq && hostQq === qq),
+        lastActiveAt: u.lastActiveAt || 0
+      };
+    });
+
+    return c.json({ code: 0, total: data.length, data }, 200);
+  } catch (error) {
+    console.error('[User List Error]', error);
+    return c.json({ code: 500, message: '获取成员列表失败' }, 500);
+  }
+});
+
+// ----------------------------------------------------
+// 路由：/api/user/sync
+// ----------------------------------------------------
+app.post('/api/user/sync', requireAuth(), async (c) => {
+  try {
+    const profile = await loadProfile(c.env, c.get('claims'));
+    const { username, avatarUrl } = await c.req.json().catch(() => ({}));
+
+    const db = await getDatabase(c.env);
+    const now = Date.now();
+
+    const updateDoc = {
+      $set: { lastActiveAt: now, updatedAt: now },
+      $setOnInsert: { createdAt: now, qq: profile.qq }
+    };
+    if (typeof username === 'string' && username.trim()) {
+      updateDoc.$set.username = username.trim();
+    }
+    if (typeof avatarUrl === 'string' && avatarUrl.trim()) {
+      updateDoc.$set.avatarUrl = avatarUrl.trim();
+    }
+
+    // qq 一律取自 token，请求体里传什么都不作数。
+    // 这里刻意不 upsert：以前会凭空造出一个没有 pin 的用户档案，
+    // 而登录逻辑把「没有 pin」当成首次绑定，等于谁都能凭 QQ 号认领这个账号。
+    const result = await db.collection('users').findOneAndUpdate(
+      { qq: profile.qq },
+      updateDoc,
+      { returnDocument: 'after' }
+    );
+
+    if (!result) {
+      return c.json({ code: 404, message: '用户档案不存在，请先使用 QQ 号登录' }, 404);
+    }
+
+    return c.json({ code: 0, message: '用户档案同步成功', data: result?.value ?? result }, 200);
+  } catch (error) {
+    console.error('[User Sync Error]', error);
+    return c.json({ code: 500, message: '服务器内部错误' }, 500);
+  }
+});
+
+// ----------------------------------------------------
+// 路由：/api/user/update-name
+// ----------------------------------------------------
+app.post('/api/user/update-name', requireAuth(), async (c) => {
+  try {
+    const profile = await loadProfile(c.env, c.get('claims'));
+    const { newUsername } = await c.req.json().catch(() => ({}));
+    const cleanName = String(newUsername || '').trim();
+
+    if (!cleanName) {
+      return c.json({ code: 400, message: '昵称不能为空' }, 400);
+    }
+    if (cleanName.length > 12) {
+      return c.json({ code: 400, message: '昵称最多 12 个字' }, 400);
+    }
+
+    const db = await getDatabase(c.env);
+    const now = Date.now();
+
+    await db.collection('users').updateOne(
+      { qq: profile.qq },
+      { $set: { username: cleanName, lastActiveAt: now, updatedAt: now } },
+      { upsert: true }
+    );
+
+    return c.json({
+      code: 0,
+      message: '昵称更新成功',
+      username: cleanName,
+      data: { qq: profile.qq, username: cleanName, avatarUrl: profile.avatarUrl }
+    }, 200);
+  } catch (err) {
+    console.error('[Update Name Error]', err);
+    return c.json({ code: 500, message: `服务器异常: ${err.message}` }, 500);
   }
 });
 
 // ----------------------------------------------------
 // 路由：/api/room/history
 // ----------------------------------------------------
-app.get('/api/room/history', async (c) => {
+app.get('/api/room/history', requireAuth(), async (c) => {
   try {
     const limit = Math.min(parseInt(c.req.query('limit')) || 10, 30);
     const db = await getDatabase(c.env);
@@ -297,292 +316,122 @@ app.get('/api/room/history', async (c) => {
   }
 });
 
-// ----------------------------------------------------
-// 路由：/api/auth/login
-// ----------------------------------------------------
-app.post('/api/auth/login', async (c) => {
-  const env = c.env;
-  const redis = getRedis(env);
-  const jwtSecret = env.JWT_SECRET || 'white667-social-music-secure-jwt-key';
+// ====================================================
+// 房间实时层：全部经 RoomHub Durable Object
+// ====================================================
 
+// ----------------------------------------------------
+// 路由：/api/room/state —— 一次性快照（WS 建连前的兜底）
+// ----------------------------------------------------
+app.get('/api/room/state', requireAuth(), async (c) => {
   try {
-    const { qq, username, pin } = await c.req.json().catch(() => ({}));
-    const rawAccount = qq || username;
-    const cleanQq = String(rawAccount || '').trim();
-    const cleanPin = String(pin || '').trim();
-
-    if (!cleanQq || !/^[1-9][0-9]{4,11}$/.test(cleanQq)) {
-      return c.json({ code: 400, message: '请输入合法的 QQ 号码' }, 400);
-    }
-
-    if (!cleanPin || cleanPin.length !== 4) {
-      return c.json({ code: 400, message: '请输入 4 位专属口令' }, 400);
-    }
-
-    const failRateKey = `login:fail:${cleanQq}`;
-    const failCount = await redis.get(failRateKey);
-    if (failCount && parseInt(failCount, 10) >= 5) {
-      return c.json({ code: 429, message: '口令错误次数过多，请 10 分钟后再试' }, 429);
-    }
-
-    const db = await getDatabase(env);
-    const usersCollection = db.collection('users');
-    const existingUser = await usersCollection.findOne({ qq: cleanQq });
-
-    if (existingUser) {
-      const storedPin = typeof existingUser.pin === 'string' ? existingUser.pin : '';
-      const isFirstBind = storedPin.length === 0;
-      const isMatch = isFirstBind || (storedPin.startsWith('$2')
-        ? await bcrypt.compare(cleanPin, storedPin)
-        : storedPin === cleanPin);
-
-      if (!isMatch) {
-        await redis.incr(failRateKey);
-        await redis.expire(failRateKey, 600);
-        return c.json({ code: 403, message: '口令错误' }, 403);
-      }
-
-      await redis.del(failRateKey);
-
-      const updateData = { lastActiveAt: Date.now() };
-      if (isFirstBind || !storedPin.startsWith('$2')) {
-        updateData.pin = await bcrypt.hash(cleanPin, 10);
-      }
-
-      await usersCollection.updateOne({ qq: cleanQq }, { $set: updateData });
-
-      const token = jwt.sign(
-        { qq: existingUser.qq, username: existingUser.username },
-        jwtSecret,
-        { expiresIn: '30d' }
-      );
-
-      const { pin: _, _id, ...safeUser } = existingUser;
-
-      return c.json({
-        code: 0,
-        message: isFirstBind ? '首次认证并绑定成功' : '登录成功',
-        token,
-        user: safeUser
-      }, 200);
-    }
-
-    const shortQq = cleanQq.slice(-4);
-    const defaultNickname = `网友_${shortQq}`;
-    const avatarUrl = `https://q1.qlogo.cn/g?b=qq&nk=${cleanQq}&s=640`;
-    const hashedPin = await bcrypt.hash(cleanPin, 10);
-
-    const newUser = {
-      qq: cleanQq,
-      username: defaultNickname,
-      avatarUrl: avatarUrl,
-      pin: hashedPin,
-      createdAt: Date.now(),
-      lastActiveAt: Date.now()
-    };
-
-    await usersCollection.insertOne(newUser);
-    await redis.del(failRateKey);
-
-    const token = jwt.sign(
-      { qq: newUser.qq, username: newUser.username },
-      jwtSecret,
-      { expiresIn: '30d' }
-    );
-
-    const { pin: _, _id, ...safeUser } = newUser;
-
-    return c.json({
-      code: 0,
-      message: '首次认证并绑定成功',
-      token,
-      user: safeUser
-    }, 200);
-
+    const profile = await loadProfile(c.env, c.get('claims'));
+    const res = await getHubStub(c.env).fetch('https://room-hub/state');
+    const snapshot = await res.json();
+    return c.json({ code: 0, ...snapshot, me: profile }, 200);
   } catch (error) {
-    console.error('[Login Error]', error);
-    return c.json({ code: 500, message: `服务器处理异常: ${error.message}` }, 500);
+    console.error('[Room State Error]', error);
+    return c.json({ code: 500, message: '获取房间状态失败' }, 500);
   }
 });
 
 // ----------------------------------------------------
-// 路由：/api/user/list
+// 路由：/api/room/ws —— 成员端实时长连接
 // ----------------------------------------------------
-app.get('/api/user/list', async (c) => {
-  const env = c.env;
-  const redis = getRedis(env);
+app.get('/api/room/ws', async (c) => {
+  const claims = readClaims(c.env, c.req.raw, new URL(c.req.url));
+  if (!claims) {
+    return c.json({ code: 401, message: '登录状态已失效，请重新登录' }, 401);
+  }
+  if ((c.req.header('Upgrade') || '').toLowerCase() !== 'websocket') {
+    return c.json({ code: 426, message: '需要 WebSocket 升级' }, 426);
+  }
 
+  // 直接把原始请求转发给 DO，才能保住 Upgrade 握手。
+  // 身份由 DO 自己再校验一次 token（纵深防御），所以这里不需要额外带头。
+  return getHubStub(c.env).fetch(c.req.raw);
+});
+
+// ----------------------------------------------------
+// 路由：/api/room/host/start —— 开播（同一房间重复调用即断线重连）
+// ----------------------------------------------------
+app.post('/api/room/host/start', requireAuth(), async (c) => {
   try {
-    const dbPromise = getDatabase(env).then(db =>
-      db.collection('users')
-        .aggregate([
-          { $match: { qq: { $type: 'string', $ne: '' } } },
-          {
-            $addFields: {
-              lastActiveAt: {
-                $convert: { input: '$lastActiveAt', to: 'long', onError: 0, onNull: 0 }
-              }
-            }
-          },
-          { $project: { pin: 0 } },
-          { $sort: { lastActiveAt: -1 } }
-        ])
-        .toArray()
-    );
+    const profile = await loadProfile(c.env, c.get('claims'));
+    const { roomId, inviter, secret, deepLink, serverUrl } = await c.req.json().catch(() => ({}));
 
-    const roomPromise = redis.get(REDIS_ROOM_KEY).catch(() => null);
-    const [users, currentRoomRaw] = await Promise.all([dbPromise, roomPromise]);
-
-    let currentHost = null;
-    if (currentRoomRaw) {
-      try {
-        const room = typeof currentRoomRaw === 'string' ? JSON.parse(currentRoomRaw) : currentRoomRaw;
-        currentHost = room?.publisher || room?.inviter || null;
-      } catch (_) {}
+    const cleanRoomId = String(roomId || '').trim();
+    if (!cleanRoomId || !deepLink) {
+      return c.json({ code: 400, message: '缺少房间链接或房间号' }, 400);
+    }
+    if (!String(secret || '').trim()) {
+      return c.json({ code: 400, message: '未解析到房间密钥' }, 400);
     }
 
-    const dataList = (users || []).map(m => ({
-      qq: m.qq,
-      username: m.username || `网友_${String(m.qq).slice(-4)}`,
-      avatarUrl: m.avatarUrl || `https://q1.qlogo.cn/g?b=qq&nk=${m.qq}&s=640`,
-      isHosting: Boolean(currentHost && (m.username === currentHost || m.qq === currentHost)),
-      lastActiveAt: m.lastActiveAt || 0
-    }));
+    const res = await getHubStub(c.env).fetch('https://room-hub/host/start', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        user: profile,
+        roomId: cleanRoomId,
+        inviter,
+        secret,
+        deepLink,
+        serverUrl
+      })
+    });
 
-    return c.json({
-      code: 0,
-      total: dataList.length,
-      data: dataList
-    }, 200);
-
+    const data = await res.json();
+    return c.json(data, res.status);
   } catch (error) {
-    console.error('[User List API Error]', error);
-    return c.json({ code: 500, message: '获取成员列表失败' }, 500);
+    console.error('[Host Start Error]', error);
+    return c.json({ code: 500, message: `开播失败: ${error.message}` }, 500);
   }
 });
 
 // ----------------------------------------------------
-// 路由：/api/user/sync
+// 路由：/api/room/host/state —— 房主上报播放状态 / 保活
 // ----------------------------------------------------
-app.post('/api/user/sync', async (c) => {
+app.post('/api/room/host/state', requireAuth(), async (c) => {
   try {
-    const { qq, username, avatarUrl } = await c.req.json().catch(() => ({}));
+    const claims = c.get('claims');
+    const { playback } = await c.req.json().catch(() => ({}));
 
-    if (!username || typeof username !== 'string') {
-      return c.json({ code: 400, message: '缺少合法的 username' }, 400);
-    }
+    const res = await getHubStub(c.env).fetch('https://room-hub/host/state', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ user: { qq: String(claims.qq) }, playback })
+    });
 
-    const db = await getDatabase(c.env);
-    const users = db.collection('users');
-
-    const cleanName = username.trim();
-    const cleanQq = String(qq || '').trim();
-    const now = Date.now();
-
-    const updateDoc = {
-      $set: { lastActiveAt: now, updatedAt: now },
-      $setOnInsert: { createdAt: now }
-    };
-
-    const cleanAvatar = typeof avatarUrl === 'string' ? avatarUrl.trim() : '';
-    if (cleanAvatar) {
-      updateDoc.$set.avatarUrl = cleanAvatar;
-    }
-
-    let result;
-
-    if (cleanQq) {
-      result = await users.findOneAndUpdate(
-        { qq: cleanQq },
-        {
-          ...updateDoc,
-          $setOnInsert: {
-            ...updateDoc.$setOnInsert,
-            qq: cleanQq,
-            username: cleanName,
-            avatarUrl: cleanAvatar || `https://q1.qlogo.cn/g?b=qq&nk=${cleanQq}&s=640`
-          }
-        },
-        { upsert: true, returnDocument: 'after' }
-      );
-    } else {
-      result = await users.findOneAndUpdate(
-        { username: cleanName },
-        updateDoc,
-        { returnDocument: 'after' }
-      );
-
-      if (!result) {
-        return c.json({ code: 404, message: '用户档案不存在，请先使用 QQ 号登录' }, 404);
-      }
-    }
-
-    return c.json({
-      code: 0,
-      message: '用户档案同步成功',
-      data: result?.value ?? result
-    }, 200);
+    const data = await res.json();
+    return c.json(data, res.status);
   } catch (error) {
-    console.error('[User Sync Error]', error);
-    return c.json({ code: 500, message: '服务器内部错误' }, 500);
+    console.error('[Host State Error]', error);
+    return c.json({ code: 500, message: '状态上报失败' }, 500);
   }
 });
 
 // ----------------------------------------------------
-// 路由：/api/user/update-name
+// 路由：/api/room/host/stop —— 房主主动关房
 // ----------------------------------------------------
-app.post('/api/user/update-name', async (c) => {
+app.post('/api/room/host/stop', requireAuth(), async (c) => {
   try {
-    const { qq, token, newUsername } = await c.req.json().catch(() => ({}));
-    let targetQq = String(qq || '').trim();
+    const claims = c.get('claims');
 
-    if (!targetQq && token) {
-      const match = String(token).match(/^token_(\d+)_/);
-      if (match) targetQq = match[1];
-    }
+    const res = await getHubStub(c.env).fetch('https://room-hub/host/stop', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ user: { qq: String(claims.qq) } })
+    });
 
-    const cleanName = String(newUsername || '').trim();
-
-    if (!targetQq) {
-      return c.json({ code: 400, message: '无法识别用户身份' }, 400);
-    }
-
-    if (!cleanName) {
-      return c.json({ code: 400, message: '昵称不能为空' }, 400);
-    }
-
-    if (cleanName.length > 12) {
-      return c.json({ code: 400, message: '昵称最多 12 个字' }, 400);
-    }
-
-    const db = await getDatabase(c.env);
-    const now = Date.now();
-
-    const result = await db.collection('users').findOneAndUpdate(
-      { qq: targetQq },
-      {
-        $set: { username: cleanName, lastActiveAt: now, updatedAt: now },
-        $setOnInsert: {
-          qq: targetQq,
-          avatarUrl: `https://q1.qlogo.cn/g?b=qq&nk=${targetQq}&s=640`,
-          createdAt: now
-        }
-      },
-      { upsert: true, returnDocument: 'after' }
-    );
-
-    const user = result?.value ?? result;
-
-    return c.json({
-      code: 0,
-      message: '昵称更新成功',
-      username: cleanName,
-      data: user ? { qq: user.qq, username: user.username, avatarUrl: user.avatarUrl } : undefined
-    }, 200);
-  } catch (err) {
-    console.error('[Update Name Error]', err);
-    return c.json({ code: 500, message: `服务器异常: ${err.message}` }, 500);
+    const data = await res.json();
+    return c.json(data, res.status);
+  } catch (error) {
+    console.error('[Host Stop Error]', error);
+    return c.json({ code: 500, message: '关房失败' }, 500);
   }
 });
+
+export { RoomHub } from './room-hub.js';
 
 export default app;

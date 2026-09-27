@@ -29,14 +29,22 @@ export async function getDatabase(env) {
   // ⚡ 核心修复：后台异步创建索引，绝不使用 await 阻塞用户请求！
   if (!isIndexesInitialized) {
     isIndexesInitialized = true;
-    Promise.all([
+    // 用 allSettled：某个索引建失败（比如历史数据本来就有重复）不该连累其它的
+    Promise.allSettled([
       db.collection('users').createIndex({ qq: 1 }, { unique: true }),
       db.collection('room_logs').createIndex(
         { startedAt: 1 },
         { expireAfterSeconds: 7776000 }
-      )
-    ]).catch(e => {
-      console.warn('[MongoDB] 索引初始化异常 (非致命):', e.message);
+      ),
+      // room_logs 按 roomId 唯一：同一个邀请链接反复开播，在历史里应该是一条记录。
+      // RoomHub.openRoomLog 的 upsert 语义依赖这个索引。
+      db.collection('room_logs').createIndex({ roomId: 1 }, { unique: true })
+    ]).then(results => {
+      for (const r of results) {
+        if (r.status === 'rejected') {
+          console.warn('[MongoDB] 索引初始化异常 (非致命):', r.reason?.message);
+        }
+      }
     });
   }
 

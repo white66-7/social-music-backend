@@ -5,3 +5,18 @@ compatibility_flags = ["nodejs_compat", "cache_option_enabled"]
 
 [vars]
 DEFAULT_NERI_SERVER = "https://neriplayer.hancat.work"
+
+# ============================================================
+# 房间实时中枢
+#
+# 全站同时只允许一个房间在放歌（/api/room/host/start 会以 409 拒绝第二个），
+# 因此用一个固定名字的 DO 实例承载「当前房间 + 在线成员」，由它直接持有
+# WebSocket 连接并广播，取代原先客户端 6~10 秒一轮的轮询。
+# ============================================================
+[[durable_objects.bindings]]
+name = "ROOM"
+class_name = "RoomHub"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RoomHub"]

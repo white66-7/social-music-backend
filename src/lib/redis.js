@@ -1,8 +1,5 @@
 import { Redis } from '@upstash/redis';
 
-export const REDIS_ROOM_KEY = 'music:active_room';
-export const ROOM_LEASE_SECONDS = 60;
-
 let cachedRedis = null;
 
 export function getRedis(env) {
@@ -19,22 +16,42 @@ export function getRedis(env) {
   return cachedRedis;
 }
 
-export async function renewRoom(redis, payload, ttlSeconds = ROOM_LEASE_SECONDS) {
-  // @upstash/redis 原生支持直接存入对象，自动处理序列化
-  await redis.set(REDIS_ROOM_KEY, payload, { ex: ttlSeconds });
-}
+// ============================================================
+// 登录失败限流
+//
+// 房间状态本身已经整体搬进 RoomHub Durable Object（它才是权威状态源），
+// 这里只保留 Redis 擅长的、天然跨实例共享的限流计数器。
+// ============================================================
 
-export async function updateRoomMeta(redis, payload) {
-  await redis.set(REDIS_ROOM_KEY, payload, { keepTtl: true });
-}
+const LOGIN_FAIL_PREFIX = 'login:fail:';
+const LOGIN_FAIL_WINDOW_SECONDS = 600;
+export const LOGIN_FAIL_LIMIT = 5;
 
-export async function loadRoom(redis) {
+export async function getLoginFailCount(redis, qq) {
   try {
-    const raw = await redis.get(REDIS_ROOM_KEY);
-    if (!raw) return null;
-    return typeof raw === 'string' ? JSON.parse(raw) : raw;
-  } catch (err) {
-    console.warn('[Redis] 房间数据解析失败:', err.message);
-    return null;
+    const raw = await redis.get(LOGIN_FAIL_PREFIX + qq);
+    return raw ? parseInt(raw, 10) || 0 : 0;
+  } catch (e) {
+    console.warn('[Redis] 读取登录失败计数失败，按未超限处理:', e.message);
+    return 0;
   }
 }
+
+export async function recordLoginFailure(redis, qq) {
+  try {
+    await redis.incr(LOGIN_FAIL_PREFIX + qq);
+    await redis.expire(LOGIN_FAIL_PREFIX + qq, LOGIN_FAIL_WINDOW_SECONDS);
+  } catch (e) {
+    console.warn('[Redis] 写入登录失败计数失败:', e.message);
+  }
+}
+
+export async function clearLoginFailures(redis, qq) {
+  try {
+    await redis.del(LOGIN_FAIL_PREFIX + qq);
+  } catch (e) {
+    console.warn('[Redis] 清除登录失败计数失败:', e.message);
+  }
+}
+
+export { LOGIN_FAIL_WINDOW_SECONDS };
