@@ -474,11 +474,14 @@ app.post('/api/room/host/state', requireAuth(), async (c) => {
 app.post('/api/room/host/stop', requireAuth(), async (c) => {
   try {
     const claims = c.get('claims');
+    // 房间号用来把这次关房限定在调用方想关的那一个房间上 ——
+    // 不带的话就是「关掉这个用户当前的房间」，迟到请求会误伤刚开好的新房
+    const { roomId } = await c.req.json().catch(() => ({}));
 
     const res = await getHubStub(c.env).fetch('https://room-hub/host/stop', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ user: { qq: String(claims.qq) } })
+      body: JSON.stringify({ user: { qq: String(claims.qq) }, roomId })
     });
 
     const data = await res.json();

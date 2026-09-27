@@ -419,6 +419,17 @@ export class RoomHub {
       return json({ code: 0, message: '非房主请求已忽略' });
     }
 
+    // 指定了房间号就必须对得上。
+    //
+    // 关房一直按「用户」关，这在并发下会误伤：用户关播后立刻重开、或者一次已作废的
+    // 开房请求迟到撤销，那条笼统的 stop 会把**刚建好的那个房间**关掉，
+    // 而房主端还显示着「房间上线成功」，直到下一次保活才悄悄 404 ——
+    // 表现就是「刚开好，过一会儿又不更新了」。
+    // 带上房间号之后，这类迟到请求只会打到它自己那一个房间上。
+    if (body.roomId && this.room && this.room.roomId !== body.roomId) {
+      return json({ code: 0, message: '房间号不匹配，已忽略' });
+    }
+
     await this.closeRoom('manual');
     return json({ code: 0, message: '房间已安全释放' });
   }

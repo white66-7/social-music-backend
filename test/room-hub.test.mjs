@@ -318,6 +318,33 @@ check('但房间依然被点亮了', snap.room?.roomId === 'pend03', JSON.string
 check('播放状态没有被迟到的那条污染', snap.room?.currentSong === '第二首', `got ${snap.room?.currentSong}`);
 await hub.fetch(post('/host/stop', { user: A }));
 
+console.log('\n[19] 关房必须锁定到具体房间号');
+// 关房按「用户」关，一条迟到的 stop（关播后立刻重开、已作废的开房请求延迟撤销）
+// 会把刚开好的新房一起关掉，而房主端还显示「房间上线成功」。
+await hub.fetch(post('/host/start', {
+  user: A, roomId: 'new001', inviter: '阿甲', secret: 's3cret',
+  deepLink: 'neriplayer://x?roomId=new001'
+}));
+check('新房已建立', hub.room?.roomId === 'new001');
+
+// 一条针对**旧房间**的迟到撤销到达
+const lateStop = await hub.fetch(post('/host/stop', { user: A, roomId: 'old999' }));
+const lateStopBody = await lateStop.json();
+check('迟到撤销被忽略', lateStopBody.message.includes('不匹配'), JSON.stringify(lateStopBody));
+check('新房间没有被误关', hub.room?.roomId === 'new001', JSON.stringify(hub.room));
+
+// 精确指向当前房间的 stop 必须正常生效
+await hub.fetch(post('/host/stop', { user: A, roomId: 'new001' }));
+check('指向当前房间的 stop 正常关房', hub.room === null);
+
+console.log('\n[19b] 不带房间号的老客户端行为不变');
+await hub.fetch(post('/host/start', {
+  user: A, roomId: 'compat1', inviter: '阿甲', secret: 's3cret',
+  deepLink: 'neriplayer://x?roomId=compat1'
+}));
+await hub.fetch(post('/host/stop', { user: A }));
+check('无 roomId 的 stop 仍然关房', hub.room === null);
+
 console.log('\n[18] 不带 pending 的老开房路径行为不变');
 await hub.fetch(post('/host/start', {
   user: A, roomId: 'old001', inviter: '阿甲', secret: 's3cret',
