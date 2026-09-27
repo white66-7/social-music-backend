@@ -9,10 +9,17 @@ import { DEFAULT_JWT_SECRET } from './lib/auth.js';
 export const ROOM_TTL_MS = 90_000;
 
 /** alarm 的巡检间隔，比 TTL 短，保证超时能被及时发现 */
-const ALARM_INTERVAL_MS = 30_000;
+const ALARM_INTERVAL_MS = 20_000;
 
-/** 主动去播放器服务器确认「房间还在不在」的间隔 */
-const EXISTENCE_CHECK_INTERVAL_MS = 60_000;
+/**
+ * 主动去播放器服务器确认「房间还在不在」的间隔。
+ *
+ * 这是**兜底**路径：正常情况下房主 App 的 Neri 长连接会先发现房间没了，
+ * 并立刻调 /api/room/host/stop 通知后端（那条路径大约 3~5 秒）。
+ * 只有房主 App 被杀掉、或它自己也在重试时才会走到这里，
+ * 所以间隔取小一点，把最坏情况压到 20~40 秒。
+ */
+const EXISTENCE_CHECK_INTERVAL_MS = 20_000;
 
 /** 探测请求的超时，避免外部服务卡住把 alarm 拖死 */
 const EXISTENCE_CHECK_TIMEOUT_MS = 8_000;
