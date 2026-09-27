@@ -12,6 +12,16 @@ export const ROOM_TTL_MS = 90_000;
 const ALARM_INTERVAL_MS = 20_000;
 
 /**
+ * 「未确认」房间的最长存活时间。
+ *
+ * 客户端会并行地一边 join 播放器校验口令、一边先把房间挂到后端（pending），
+ * 这样开房只需等两次往返里较慢的那一次，而不是相加。
+ * 口令校验失败、或客户端半路被杀时，这个占位房间必须自己烂掉。
+ * pending 房间对成员端不可见，所以回收它纯粹是资源问题，不会影响任何人。
+ */
+const PENDING_TTL_MS = 30_000;
+
+/**
  * 主动去播放器服务器确认「房间还在不在」的间隔。
  *
  * 这是**兜底**路径：正常情况下房主 App 的 Neri 长连接会先发现房间没了，
@@ -46,6 +56,12 @@ function json(data, status = 200) {
  */
 function publicRoom(room) {
   if (!room) return null;
+
+  // 未经房主确认的房间（口令还在校验中）对成员端完全不可见。
+  // 否则一次失败的邀请会短暂地在所有人屏幕上闪出一个幽灵房间。
+  // 房主自己也不需要这份数据 —— 它本来就知道 roomId，等确认后由快照接管。
+  if (room.pending) return null;
+
   return {
     roomId: room.roomId,
     inviter: room.inviter,
@@ -131,11 +147,15 @@ export class RoomHub {
       if (!prev || (att.joinedAt || 0) < (prev.joinedAt || 0)) byQq.set(att.qq, att);
     }
 
+    // pending 房间还没被房主确认，不能拿它合成成员或角标 ——
+    // 否则一次失败的邀请会让所有人短暂看到「某某正在放歌」。
+    const hostQq = this.room && !this.room.pending ? this.room.publisherQq : null;
+
     // 房主把 App 切到后台时可能断开连接，但他还在放歌，必须留在成员列表里，
     // 否则成员数会莫名其妙地掉一个。
-    if (this.room?.publisherQq && !byQq.has(this.room.publisherQq)) {
-      byQq.set(this.room.publisherQq, {
-        qq: this.room.publisherQq,
+    if (hostQq && !byQq.has(hostQq)) {
+      byQq.set(hostQq, {
+        qq: hostQq,
         username: this.room.publisher,
         avatarUrl: this.room.hostAvatarUrl || '',
         joinedAt: this.room.startedAt || 0
@@ -148,7 +168,7 @@ export class RoomHub {
         qq: m.qq,
         username: m.username,
         avatarUrl: m.avatarUrl || '',
-        isHosting: Boolean(this.room?.publisherQq && m.qq === this.room.publisherQq)
+        isHosting: Boolean(hostQq && m.qq === hostQq)
       }));
   }
 
@@ -163,8 +183,12 @@ export class RoomHub {
    */
   async bumpAndBroadcast() {
     this.version += 1;
-    await this.persist();
 
+    // 先把快照推出去，再落盘。
+    // 落盘是一次 await 的存储往返，放在前面等于让每个成员的画面都先等它一下 ——
+    // 而版本号和快照在内存里已经自洽，先发没有一致性风险。
+    // 最坏情况是 DO 在落盘前被回收、版本号回退一格，而客户端只丢弃「严格更旧」的
+    // 版本（MainActivity.applySnapshot），所以不会错乱。
     const text = JSON.stringify(this.snapshot());
     for (const ws of this.ctx.getWebSockets()) {
       try {
@@ -173,6 +197,8 @@ export class RoomHub {
         // 连接刚断，交给 webSocketClose 去收敛成员列表
       }
     }
+
+    await this.persist();
   }
 
   // ==========================================================
@@ -302,13 +328,29 @@ export class RoomHub {
       playbackRate: prev?.playbackRate ?? 1,
       isPlaying: prev?.isPlaying ?? false,
       startedAt: prev?.startedAt ?? now,
+
+      // 客户端并行开房：先挂一个占位房间，等口令校验通过再 confirm。
+      // 不传 pending 的调用方行为完全不变。
+      pending: body.pending === true,
+
+      // 每次 start 都把上报序号的高水位归零 —— 它是客户端「我重新开始计数」的信号。
+      // 不归零的话，App 重启后客户端 seq 从 1 开始，会被旧的高水位永久饿死，
+      // 表现就是「重启后切歌再也不生效」。
+      lastStateSeq: 0,
+
       lastHeartbeatAt: now
     };
 
     await this.bumpAndBroadcast();
     await this.ensureAlarm();
 
-    return json({ code: 0, message: '房间开播成功', data: publicRoom(this.room) });
+    return json({
+      code: 0,
+      message: this.room.pending ? '房间已受理，等待口令校验' : '房间开播成功',
+      pending: Boolean(this.room.pending),
+      // pending 房间里 publicRoom() 返回 null，房主端会等确认后的快照接管
+      data: publicRoom(this.room)
+    });
   }
 
   async handleHostState(request) {
@@ -325,6 +367,29 @@ export class RoomHub {
     const now = Date.now();
     this.room.lastHeartbeatAt = now;
 
+    // 「确认房间可见」和「播放状态」是两件独立的事：前者只关系到房间对成员是否可见，
+    // 不该被播放状态的序号闸门挡住 —— 否则一条迟到的上报顺手把 confirm 也吞掉，
+    // 房间就永远亮不出来了。所以它放在序号检查之前。
+    let justRevealed = false;
+    if (body.confirm === true && this.room.pending) {
+      this.room.pending = false;
+      justRevealed = true;
+    }
+
+    // 序号保护 —— 这是「切歌跳回去」的根因。
+    //
+    // 客户端在跨境长链路上是并发上报的（1~8 秒的往返），先发的后到是常态。
+    // 没有这道闸，一次迟到的「上一首」上报会把刚切的新歌覆盖回去，
+    // 成员端看到的就是「切歌没反应」或者「又跳回上一首了」。
+    //
+    // 心跳在上面已经续过了，所以这里直接返回安全 —— 不会把房主误判成掉线。
+    // 不写状态、不落盘：这条路径要尽可能廉价。
+    if (playback && typeof playback.seq === 'number' && playback.seq <= (this.room.lastStateSeq || 0)) {
+      // 唯一的例外：这一条顺手把房间点亮了，那就必须广播出去，不然没人知道它可见了
+      if (justRevealed) await this.bumpAndBroadcast();
+      return json({ code: 0, message: 'ok', stale: true, revealed: justRevealed });
+    }
+
     if (playback) {
       if (playback.currentSong !== undefined) this.room.currentSong = playback.currentSong;
       if (playback.currentCover !== undefined) this.room.currentCover = playback.currentCover;
@@ -332,12 +397,17 @@ export class RoomHub {
       if (typeof playback.basePositionMs === 'number') this.room.basePositionMs = playback.basePositionMs;
       if (typeof playback.isPlaying === 'boolean') this.room.isPlaying = playback.isPlaying;
       if (typeof playback.playbackRate === 'number') this.room.playbackRate = playback.playbackRate;
+      if (typeof playback.seq === 'number') this.room.lastStateSeq = playback.seq;
       // 位置锚点必须跟着上报时刻一起刷新，否则成员端会拿旧锚点继续外推
       this.room.baseTimestampMs = now;
+      // 收到真实播放状态 = 房主的口令校验已经通过（他在报歌了），房间对成员可见
+      this.room.pending = false;
     }
 
+    // 这里刻意不再调 ensureAlarm()：alarm 链是自维持的
+    // （hostStart 设一次，alarm() 结尾自己续期），而它每次都要读一遍 storage。
+    // 扇出路径上多一次存储往返就是让所有成员的画面一起多等一次。
     await this.bumpAndBroadcast();
-    await this.ensureAlarm();
 
     return json({ code: 0, message: 'ok' });
   }
@@ -369,15 +439,30 @@ export class RoomHub {
     if (!this.room) return;
 
     const idle = Date.now() - (this.room.lastHeartbeatAt || 0);
+
+    // pending 房间还没等到口令校验结果，用更短的窗口把它清掉。
+    // 它对成员端不可见，所以回收它纯粹是防垃圾（客户端校验途中被杀的情况）。
+    if (this.room.pending && idle > PENDING_TTL_MS) {
+      console.warn('[RoomHub] 房间确认超时（口令校验未完成），自动回收');
+      await this.closeRoom('pending_timeout');
+      return;
+    }
+
     if (idle > ROOM_TTL_MS) {
       console.warn(`[RoomHub] 房主心跳已中断 ${Math.round(idle / 1000)}s，自动关房`);
       await this.closeRoom('timeout');
       return;
     }
 
-    await this.verifyRoomStillExists();
+    // pending 房间去播放器服务器探测毫无意义 —— 房主还没 join 成功，
+    // 那边本来就查不到这个房间，探了只会误判成「房间已消失」。
+    if (!this.room.pending) {
+      await this.verifyRoomStillExists();
+    }
 
-    await this.ensureAlarm();
+    // 无条件续期：能走到这里说明本次 alarm 已经触发，旧闹钟必然不存在了，
+    // 再读一次 getAlarm() 纯属多一次存储往返。
+    await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
   }
 
   /**

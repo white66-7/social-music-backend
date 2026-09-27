@@ -108,6 +108,30 @@ async function safeRoomLog(label, work) {
   }
 }
 
+/**
+ * 把副作用挪出响应路径。
+ *
+ * 房间历史是旁路数据，没有任何理由让「开启房间」这种实时操作去等它 ——
+ * 跨境链路上一次 D1 写往返就是几百毫秒到几秒，用户是直接能感觉到的。
+ *
+ * executionCtx 只在真正的 Worker 请求里存在；本地单测直接调 handler 时会抛，
+ * 那时退回 await，行为与改动前一致。
+ */
+function background(c, work) {
+  let ctx = null;
+  try {
+    ctx = c.executionCtx;
+  } catch (e) {
+    ctx = null;
+  }
+
+  if (ctx) {
+    ctx.waitUntil(work());
+    return;
+  }
+  return work();
+}
+
 // ----------------------------------------------------
 // 路由：/api/auth/login
 // ----------------------------------------------------
@@ -339,9 +363,10 @@ app.get('/api/room/state', requireAuth(), async (c) => {
     const res = await getHubStub(c.env).fetch('https://room-hub/state');
     const snapshot = await res.json();
 
-    // 权威状态说没有房间，但历史里还有 active —— 那是房主被超时回收了
+    // 权威状态说没有房间，但历史里还有 active —— 那是房主被超时回收了。
+    // 这是旁路收尾，不该让客户端的首屏快照等它。
     if (!snapshot.room) {
-      await sweepStaleRoomLogs(c.env);
+      background(c, () => sweepStaleRoomLogs(c.env));
     }
 
     return c.json({ code: 0, ...snapshot }, 200);
@@ -403,15 +428,15 @@ app.post('/api/room/host/start', requireAuth(), async (c) => {
     const data = await res.json();
 
     // 只有 RoomHub 确认房间归我（没被 409 挡下）才记历史。
-    // 历史是旁路数据，写失败也不影响开播。
+    // 历史是旁路数据，写失败也不影响开播，而且不该挡住开播的响应。
     if (res.ok) {
-      await safeRoomLog('写入', () => upsertRoomLog(c.env, {
+      background(c, () => safeRoomLog('写入', () => upsertRoomLog(c.env, {
         roomId: cleanRoomId,
         publisher: user.username,
         inviter: inviter || user.username,
         hostAvatarUrl: user.avatarUrl,
         deepLink
-      }));
+      })));
     }
 
     return c.json(data, res.status);
@@ -459,7 +484,7 @@ app.post('/api/room/host/stop', requireAuth(), async (c) => {
     const data = await res.json();
 
     if (res.ok) {
-      await safeRoomLog('归档', () => endActiveRoomLogs(c.env, 'manual'));
+      background(c, () => safeRoomLog('归档', () => endActiveRoomLogs(c.env, 'manual')));
     }
 
     return c.json(data, res.status);

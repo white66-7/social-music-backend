@@ -186,6 +186,147 @@ check('网络异常时房间保留', snap.room?.roomId === 'alive01');
 // 收尾，避免影响后续静态检查以外的状态
 await hub.fetch(post('/host/stop', { user: A }));
 
+console.log('\n[14] 顺序保护：迟到上报不得覆盖新状态');
+// 跨境链路上往返 1~8 秒，客户端并发上报必然乱序。
+// 没有这道闸，一次迟到的「上一首」会把刚切的新歌覆盖回去 ——
+// 用户看到的就是「切歌没反应 / 又跳回上一首」。
+await hub.fetch(post('/host/start', {
+  user: A, roomId: 'seq001', inviter: '阿甲', secret: 's3cret',
+  deepLink: 'neriplayer://x?roomId=seq001'
+}));
+
+await hub.fetch(post('/host/state', {
+  user: A,
+  playback: { currentSong: '歌曲B - 新歌', durationMs: 300000, basePositionMs: 0, isPlaying: true, seq: 2 }
+}));
+let seqRoom = (await (await hub.fetch(new Request('https://room-hub/state'))).json()).room;
+check('新歌已生效', seqRoom.currentSong === '歌曲B - 新歌', `got ${seqRoom.currentSong}`);
+
+// 更早发出、更晚落地的那一条
+const staleRes = await hub.fetch(post('/host/state', {
+  user: A,
+  playback: { currentSong: '歌曲A - 旧歌', durationMs: 300000, basePositionMs: 120000, isPlaying: true, seq: 1 }
+}));
+const staleBody = await staleRes.json();
+seqRoom = (await (await hub.fetch(new Request('https://room-hub/state'))).json()).room;
+check('陈旧上报被标记为 stale', staleBody.stale === true, JSON.stringify(staleBody));
+check('新歌没有被覆盖回去', seqRoom.currentSong === '歌曲B - 新歌', `got ${seqRoom.currentSong}`);
+check('位置锚点也没有被覆盖', seqRoom.basePositionMs === 0, `got ${seqRoom.basePositionMs}`);
+
+// 同一个 seq 重复投递（重试场景）同样要忽略
+await hub.fetch(post('/host/state', {
+  user: A, playback: { currentSong: '歌曲C - 重放', isPlaying: true, seq: 2 }
+}));
+seqRoom = (await (await hub.fetch(new Request('https://room-hub/state'))).json()).room;
+check('同 seq 重放被忽略', seqRoom.currentSong === '歌曲B - 新歌', `got ${seqRoom.currentSong}`);
+
+await hub.fetch(post('/host/state', {
+  user: A, playback: { currentSong: '歌曲C - 更新', isPlaying: true, seq: 3 }
+}));
+seqRoom = (await (await hub.fetch(new Request('https://room-hub/state'))).json()).room;
+check('更大的 seq 正常生效', seqRoom.currentSong === '歌曲C - 更新', `got ${seqRoom.currentSong}`);
+
+// 被丢弃的上报也必须续上心跳，否则房主会被 TTL 误杀
+hub.room.lastHeartbeatAt = Date.now() - 200_000;
+await hub.fetch(post('/host/state', { user: A, playback: { currentSong: '陈旧', isPlaying: true, seq: 1 } }));
+check('陈旧上报仍然续上了心跳', Date.now() - hub.room.lastHeartbeatAt < 5_000);
+
+console.log('\n[15] 不带 seq 的上报按原样处理（向后兼容）');
+await hub.fetch(post('/host/state', {
+  user: A, playback: { currentSong: '老客户端 - 兼容', isPlaying: true }
+}));
+seqRoom = (await (await hub.fetch(new Request('https://room-hub/state'))).json()).room;
+check('无 seq 上报正常生效', seqRoom.currentSong === '老客户端 - 兼容', `got ${seqRoom.currentSong}`);
+
+console.log('\n[16] 重开房必须重置序号高水位');
+// 此时高水位是 3。模拟 App 重启后客户端从 1 重新计数 ——
+// 不重置的话它会被永久饿死，表现为「重启后切歌再也不生效」。
+await hub.fetch(post('/host/start', {
+  user: A, roomId: 'seq001', inviter: '阿甲', secret: 's3cret',
+  deepLink: 'neriplayer://x?roomId=seq001'
+}));
+check('hostStart 已重置高水位', (hub.room.lastStateSeq || 0) === 0, `got ${hub.room.lastStateSeq}`);
+
+await hub.fetch(post('/host/state', {
+  user: A, playback: { currentSong: '重启后的第一首', isPlaying: true, seq: 1 }
+}));
+seqRoom = (await (await hub.fetch(new Request('https://room-hub/state'))).json()).room;
+check('重启后 seq=1 依然生效（没被饿死）', seqRoom.currentSong === '重启后的第一首', `got ${seqRoom.currentSong}`);
+await hub.fetch(post('/host/stop', { user: A }));
+
+console.log('\n[17] pending 房间对成员端完全不可见');
+// 客户端并行开房时先把房间挂成 pending，省掉一次跨境往返。
+// 口令校验没过时它必须是个隐形占位，绝不能闪成一个幽灵房间。
+const pendRes = await hub.fetch(post('/host/start', {
+  user: A, roomId: 'pend01', inviter: '阿甲', secret: 's3cret',
+  deepLink: 'neriplayer://x?roomId=pend01', pending: true
+}));
+const pendBody = await pendRes.json();
+check('开房请求被受理', pendRes.status === 200, `got ${pendRes.status}`);
+check('响应标注 pending', pendBody.pending === true);
+check('响应里不含房间数据', pendBody.data === null, JSON.stringify(pendBody.data));
+
+snap = await (await hub.fetch(new Request('https://room-hub/state'))).json();
+check('快照里看不到 pending 房间', snap.room === null, JSON.stringify(snap.room));
+check('members 里不合成房主', !snap.members.some(m => m.qq === '1001'), JSON.stringify(snap.members));
+
+const pendPresence = await (await hub.fetch(new Request('https://room-hub/members'))).json();
+check('/members 里不合成房主', !pendPresence.members.some(m => m.isHosting));
+
+console.log('\n[17b] confirm 之后立刻对成员可见');
+await hub.fetch(post('/host/state', { user: A, confirm: true }));
+snap = await (await hub.fetch(new Request('https://room-hub/state'))).json();
+check('房间已对成员可见', snap.room?.roomId === 'pend01', JSON.stringify(snap.room));
+check('房主角标恢复', snap.members.some(m => m.qq === '1001' && m.isHosting));
+await hub.fetch(post('/host/stop', { user: A }));
+
+console.log('\n[17c] 未确认的 pending 房间会被自动回收');
+await hub.fetch(post('/host/start', {
+  user: A, roomId: 'pend02', inviter: '阿甲', secret: 's3cret',
+  deepLink: 'neriplayer://x?roomId=pend02', pending: true
+}));
+// 60 秒：超过 PENDING_TTL_MS(30s)，但远未到 ROOM_TTL_MS(90s)
+hub.room.lastHeartbeatAt = Date.now() - 60_000;
+await hub.alarm();
+snap = await (await hub.fetch(new Request('https://room-hub/state'))).json();
+check('pending 房间已被回收', snap.room === null);
+check('关房原因是 pending_timeout', ctx.sockets.some(s => {
+  const m = s.last();
+  return m?.type === 'room_closed' && m.reason === 'pending_timeout';
+}));
+
+console.log('\n[17d] confirm 捎在一条迟到的上报上时也必须生效');
+// confirm 只关系到「房间是否对成员可见」，不该被播放状态的序号闸门吞掉。
+// 否则合并通道用一条新播放状态覆盖掉 confirm 请求时，房间就永远亮不出来。
+await hub.fetch(post('/host/start', {
+  user: A, roomId: 'pend03', inviter: '阿甲', secret: 's3cret',
+  deepLink: 'neriplayer://x?roomId=pend03', pending: true
+}));
+await hub.fetch(post('/host/state', {
+  user: A, playback: { currentSong: '第二首', isPlaying: true, seq: 5 }
+}));
+check('先就位一个高水位', hub.room.lastStateSeq === 5);
+
+// 一条迟到的上报（seq 更小）顺手捎带着 confirm
+const lateConfirm = await hub.fetch(post('/host/state', {
+  user: A, confirm: true, playback: { currentSong: '第一首', isPlaying: true, seq: 2 }
+}));
+const lateBody = await lateConfirm.json();
+snap = await (await hub.fetch(new Request('https://room-hub/state'))).json();
+check('被识别为迟到', lateBody.stale === true);
+check('但房间依然被点亮了', snap.room?.roomId === 'pend03', JSON.stringify(snap.room));
+check('播放状态没有被迟到的那条污染', snap.room?.currentSong === '第二首', `got ${snap.room?.currentSong}`);
+await hub.fetch(post('/host/stop', { user: A }));
+
+console.log('\n[18] 不带 pending 的老开房路径行为不变');
+await hub.fetch(post('/host/start', {
+  user: A, roomId: 'old001', inviter: '阿甲', secret: 's3cret',
+  deepLink: 'neriplayer://x?roomId=old001'
+}));
+snap = await (await hub.fetch(new Request('https://room-hub/state'))).json();
+check('房间立刻可见（没有 pending 延迟）', snap.room?.roomId === 'old001', JSON.stringify(snap.room));
+await hub.fetch(post('/host/stop', { user: A }));
+
 console.log('\n[10] 静态约束：DO 不得引入跨 I/O 上下文的依赖');
 // Durable Object 与 Worker 同 isolate 但属于不同 I/O 上下文。
 // 之前 DO 里调 getDatabase() 复用了 Worker 建立的 Mongo 连接，线上表现为
